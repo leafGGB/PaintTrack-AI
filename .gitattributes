@@ -1,0 +1,5 @@
+# 迁移 SQL 由 tests/databaseLifecycle.test.js 做「原始字节」sha256 校验，
+# 行尾必须是 LF。Windows 上 PortableGit 默认 core.autocrlf=true，会在 checkout
+# 时把 LF 转成 CRLF，导致 0000/0001/0002 的哈希断言失败。此处显式钉死 LF，
+# .gitattributes 优先级高于 core.autocrlf。
+*.sql text eol=lf
