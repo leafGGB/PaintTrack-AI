@@ -31,6 +31,8 @@ import {
 } from "./prompt/PromptComposer.jsx";
 import en from "../messages/en/recastStudio.json";
 import zh from "../messages/zh/recastStudio.json";
+import ConfirmDialog from "./ui/ConfirmDialog.jsx";
+import { getConfirmCopy } from "../confirmCopy.js";
 import { resolveCopy } from "../i18nUtils";
 
 // ---------------------------------------------------------------------------
@@ -490,6 +492,7 @@ export default function RecastStudio({
   locale = "en",
 }) {
   const copy = resolveCopy(en, zh, locale);
+  const confirmCopy = getConfirmCopy(locale);
   const LEGACY_PERSIST_KEY = "hg_recast_studio_persistent";
   const PERSIST_KEY = scopedPersistKey(LEGACY_PERSIST_KEY, apiKey);
   useEffect(() => {
@@ -567,6 +570,10 @@ export default function RecastStudio({
 
   // ── History ───────────────────────────────────────────────────────────────
   const [internalHistory, setInternalHistory] = useState([]);
+  // Deletion goes through the in-app ConfirmDialog instead of window.confirm().
+  // The mobile action used a hard-coded English string; both entries now share
+  // the same localized copy.
+  const [pendingDeleteIdx, setPendingDeleteIdx] = useState(null);
   const history = historyItems ?? internalHistory;
 
   // ── Dropdown state ────────────────────────────────────────────────────────
@@ -906,9 +913,7 @@ export default function RecastStudio({
                     title={copy.buttons.delete}
                     onClick={(e) => {
                       e.stopPropagation();
-                      if (confirm(copy.confirm.deleteGenerated)) {
-                        setInternalHistory(prev => prev.filter((_, i) => i !== idx));
-                      }
+                      setPendingDeleteIdx(idx);
                     }}
                     className="p-2 bg-black/60 backdrop-blur-md rounded-full text-red-400 hover:bg-red-500 hover:text-white transition-all border border-white/10"
                   >
@@ -935,9 +940,7 @@ export default function RecastStudio({
                       label: copy.buttons.delete,
                       danger: true,
                       onSelect: () => {
-                        if (confirm("Are you sure you want to delete this generated item?")) {
-                          setInternalHistory((prev) => prev.filter((_, i) => i !== idx));
-                        }
+                        setPendingDeleteIdx(idx);
                       },
                     },
                   ]}
@@ -1291,6 +1294,20 @@ export default function RecastStudio({
           })()}
         </div>
       )}
+      {/* ── DELETE CONFIRM ── */}
+      <ConfirmDialog
+        open={pendingDeleteIdx !== null}
+        title={confirmCopy.deleteTitle}
+        description={confirmCopy.deleteDescription}
+        confirmLabel={confirmCopy.deleteAction}
+        cancelLabel={confirmCopy.deleteCancel}
+        onConfirm={() => {
+          setInternalHistory((prev) => prev.filter((_, i) => i !== pendingDeleteIdx));
+          setPendingDeleteIdx(null);
+        }}
+        onCancel={() => setPendingDeleteIdx(null)}
+      />
+
       <Toaster position="top-right" containerStyle={{ zIndex: 99999 }} toastOptions={{ duration: 5000, style: { background: '#18181b', color: '#ffffff', border: '1px solid rgba(255,255,255,0.15)', fontSize: '13px', borderRadius: '12px', boxShadow: '0 10px 30px rgba(0,0,0,0.6)', maxWidth: '440px', wordBreak: 'break-word', whiteSpace: 'pre-wrap', padding: '12px 16px' } }} />
     </div>
   );

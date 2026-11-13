@@ -56,7 +56,7 @@ export function McpCliStudio() {
         tag: 'MCP',
         title: 'muapi-mcp-server',
         body: 'Connect Claude, Cursor, Windsurf, and any MCP-compatible assistant to 100+ generative models. Hosted endpoint — no install. 19 structured tools with input/output schemas, async polling, and account management.',
-        code: 'claude mcp add --transport http muapi \\\n  https://api.muapi.ai/mcp \\\n  --header "Authorization: Bearer YOUR_KEY"',
+        code: '# Direct provider access is disabled.\n# Configure the server-side provider instead (see docs/records/DB_SETUP.md).',
         link: 'https://github.com/SamurAIGPT/muapi-mcp-server',
         linkLabel: 'View muapi-mcp-server on GitHub',
         icon: `<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 1v6M12 17v6M4.22 4.22l4.24 4.24M15.54 15.54l4.24 4.24M1 12h6M17 12h6M4.22 19.78l4.24-4.24M15.54 8.46l4.24-4.24"/></svg>`,

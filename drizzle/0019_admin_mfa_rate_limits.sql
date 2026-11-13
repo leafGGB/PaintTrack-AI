@@ -1,0 +1,2 @@
+ALTER TABLE "auth_rate_limits" DROP CONSTRAINT "auth_rate_limits_bucket_check";--> statement-breakpoint
+ALTER TABLE "auth_rate_limits" ADD CONSTRAINT "auth_rate_limits_bucket_check" CHECK ("auth_rate_limits"."bucket" IN ('register', 'verify-email', 'login', 'password-reset', 'mfa-login', 'mfa-recovery'));

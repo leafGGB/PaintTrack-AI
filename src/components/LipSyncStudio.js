@@ -1,6 +1,6 @@
 import { muapi } from '../lib/muapi.js';
 import { lipsyncModels, imageLipSyncModels, videoLipSyncModels, getLipSyncModelById, getResolutionsForLipSyncModel } from '../lib/models.js';
-import { AuthModal } from './AuthModal.js';
+import { isClientProviderConfigured, notifyProviderUnavailable } from '../lib/providerAvailability.js';
 import { t } from '../lib/i18n.js';
 import { createUploadPicker } from './UploadPicker.js';
 import { savePendingJob, removePendingJob, getPendingJobs } from '../lib/pendingJobs.js';
@@ -169,8 +169,7 @@ export function LipSyncStudio() {
     videoFileInput.onchange = async (e) => {
         const file = e.target.files[0];
         if (!file) return;
-        const apiKey = localStorage.getItem('muapi_key');
-        if (!apiKey) { AuthModal(() => videoFileInput.click()); return; }
+        if (!isClientProviderConfigured()) { notifyProviderUnavailable(); return; }
         showVideoSpinner();
         try {
             uploadedVideoUrl = await muapi.uploadFile(file);
@@ -237,8 +236,7 @@ export function LipSyncStudio() {
     audioFileInput.onchange = async (e) => {
         const file = e.target.files[0];
         if (!file) return;
-        const apiKey = localStorage.getItem('muapi_key');
-        if (!apiKey) { AuthModal(() => audioFileInput.click()); return; }
+        if (!isClientProviderConfigured()) { notifyProviderUnavailable(); return; }
         showAudioSpinner();
         try {
             uploadedAudioUrl = await muapi.uploadFile(file);
@@ -585,31 +583,11 @@ export function LipSyncStudio() {
     } catch { /* ignore */ }
 
     // Resume pending jobs
+    // 阶段 4.5.3：浏览器不再持有供应商凭据，无法恢复远程轮询。任务保留在本地存储中。
     (async () => {
         const pending = getPendingJobs('lipsync');
         if (!pending.length) return;
-        const apiKey = localStorage.getItem('muapi_key');
-        if (!apiKey) return;
-        const banner = document.createElement('div');
-        banner.className = 'fixed top-4 left-1/2 -translate-x-1/2 z-[200] bg-[#111] border border-white/10 text-white text-sm px-5 py-3 rounded-2xl shadow-xl flex items-center gap-3';
-        banner.innerHTML = `<span class="animate-spin text-primary">◌</span> <span class="banner-text">Resuming ${pending.length} pending generation${pending.length > 1 ? 's' : ''}…</span>`;
-        document.body.appendChild(banner);
-        let remaining = pending.length;
-        pending.forEach(async (job) => {
-            const elapsedAttempts = Math.floor((Date.now() - job.submittedAt) / job.interval);
-            const attemptsLeft = Math.max(1, job.maxAttempts - elapsedAttempts);
-            try {
-                const result = await muapi.pollForResult(job.requestId, apiKey, attemptsLeft, job.interval);
-                const url = result.outputs?.[0] || result.url || result.output?.url;
-                if (url) addToHistory({ id: job.requestId, url, ...job.historyMeta, timestamp: new Date().toISOString() });
-            } catch (e) { console.warn('[LipSyncStudio] Pending job failed:', job.requestId, e.message); }
-            finally {
-                removePendingJob(job.requestId);
-                remaining--;
-                if (remaining === 0) banner.remove();
-                else banner.querySelector('.banner-text').textContent = `Resuming ${remaining} pending generation${remaining > 1 ? 's' : ''}…`;
-            }
-        });
+        if (!isClientProviderConfigured()) return;
     })();
 
     // ==========================================
@@ -668,8 +646,7 @@ export function LipSyncStudio() {
             return;
         }
 
-        const apiKey = localStorage.getItem('muapi_key');
-        if (!apiKey) { AuthModal(() => generateBtn.click()); return; }
+        if (!isClientProviderConfigured()) { notifyProviderUnavailable(); return; }
 
         hero.classList.add('opacity-0', 'scale-95', '-translate-y-10', 'pointer-events-none');
         generateBtn.disabled = true;

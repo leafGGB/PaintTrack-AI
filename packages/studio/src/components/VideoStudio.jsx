@@ -99,6 +99,8 @@ import usePromptMenu from "./prompt/usePromptMenu.js";
 import en from "../messages/en/videoStudio.json";
 import zh from "../messages/zh/videoStudio.json";
 import { resolveCopy } from "../i18nUtils";
+import ConfirmDialog from "./ui/ConfirmDialog.jsx";
+import { getConfirmCopy } from "../confirmCopy.js";
 
 async function downloadFile(url, filename) {
   try {
@@ -783,6 +785,7 @@ export default function VideoStudio({
   locale = "en",
 }) {
   const copy = useMemo(() => resolveCopy(en, zh, locale), [locale]);
+  const confirmCopy = getConfirmCopy(locale);
   const LEGACY_PERSIST_KEY = "hg_video_studio_persistent";
   const PERSIST_KEY = scopedPersistKey(LEGACY_PERSIST_KEY, apiKey);
   useEffect(() => {
@@ -921,6 +924,44 @@ export default function VideoStudio({
       setLocalHistory((prev) => prev.filter((_, i) => i !== idx));
     }
   }, [historyItems, onDeleteHistoryItem]);
+
+  // Deletion confirmation goes through the in-app ConfirmDialog instead of
+  // window.confirm(): the native dialog carries browser chrome, localizes its
+  // buttons to the browser locale, and cannot show an in-flight or failed
+  // state — a server-backed delete needs both.
+  const [pendingDelete, setPendingDelete] = useState(null); // { entry, idx }
+  const [deleteBusy, setDeleteBusy] = useState(false);
+  const [deleteError, setDeleteError] = useState(null);
+
+  const describeDeleteError = useCallback(
+    (err) => formatErrorMessage(err, copy.errors.deleteItemFailed),
+    [copy.errors.deleteItemFailed],
+  );
+
+  const requestDelete = useCallback((entry, idx) => {
+    setDeleteError(null);
+    setPendingDelete({ entry, idx });
+  }, []);
+
+  const cancelDelete = useCallback(() => {
+    if (deleteBusy) return;
+    setPendingDelete(null);
+    setDeleteError(null);
+  }, [deleteBusy]);
+
+  const confirmDelete = useCallback(async () => {
+    if (!pendingDelete || deleteBusy) return;
+    setDeleteBusy(true);
+    setDeleteError(null);
+    try {
+      await handleDeleteEntry(pendingDelete.entry, pendingDelete.idx);
+      setPendingDelete(null);
+    } catch (err) {
+      setDeleteError(describeDeleteError(err));
+    } finally {
+      setDeleteBusy(false);
+    }
+  }, [pendingDelete, deleteBusy, handleDeleteEntry, describeDeleteError]);
 
   const getCurrentAspectRatios = useCallback(
     (id) =>
@@ -2553,11 +2594,7 @@ export default function VideoStudio({
                       title={copy.gallery.delete}
                       onClick={(e) => {
                         e.stopPropagation();
-                        if (confirm(copy.gallery.confirmDelete)) {
-                          handleDeleteEntry(entry, idx).catch((err) => {
-                            onGenerationError?.(err.message || copy.errors.deleteItemFailed);
-                          });
-                        }
+                        requestDelete(entry, idx);
                       }}
                       className="p-2 bg-black/60 backdrop-blur-md rounded-full text-red-400 hover:bg-red-500 hover:text-white transition-all border border-white/10"
                     >
@@ -2589,11 +2626,7 @@ export default function VideoStudio({
                         label: copy.gallery.delete,
                         danger: true,
                         onSelect: () => {
-                          if (confirm(copy.gallery.confirmDelete)) {
-                            handleDeleteEntry(entry, idx).catch((err) => {
-                              onGenerationError?.(err.message || copy.errors.deleteItemFailed);
-                            });
-                          }
+                          requestDelete(entry, idx);
                         },
                       },
                     ]}
@@ -3451,6 +3484,19 @@ export default function VideoStudio({
         apiKey={apiKey}
         batchSize={1}
         onAddHistoryItem={handleDrawReference}
+      />
+      {/* ── DELETE CONFIRM ── */}
+      <ConfirmDialog
+        open={Boolean(pendingDelete)}
+        title={confirmCopy.deleteTitle}
+        description={confirmCopy.deleteDescription}
+        confirmLabel={confirmCopy.deleteAction}
+        cancelLabel={confirmCopy.deleteCancel}
+        busyLabel={confirmCopy.deleteBusy}
+        busy={deleteBusy}
+        error={deleteError}
+        onConfirm={confirmDelete}
+        onCancel={cancelDelete}
       />
       <Toaster position="top-right" containerStyle={{ zIndex: 99999 }} toastOptions={{ duration: 5000, style: { background: '#18181b', color: '#ffffff', border: '1px solid rgba(255,255,255,0.15)', fontSize: '13px', borderRadius: '12px', boxShadow: '0 10px 30px rgba(0,0,0,0.6)', maxWidth: '440px', wordBreak: 'break-word', whiteSpace: 'pre-wrap', padding: '12px 16px' } }} />
     </div>

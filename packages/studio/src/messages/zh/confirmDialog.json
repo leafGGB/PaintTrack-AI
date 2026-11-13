@@ -1,0 +1,8 @@
+{
+  "deleteTitle": "删除这一项？",
+  "deleteDescription": "删除后无法恢复。",
+  "deleteAction": "删除",
+  "deleteCancel": "取消",
+  "deleteBusy": "正在删除…",
+  "failed": "删除失败"
+}

@@ -45,7 +45,9 @@ export async function pollForGenerationResult({
     let response;
     try {
       response = await fetchImpl(pollUrl, {
-        headers: { "Content-Type": "application/json", "x-api-key": apiKey },
+        // 阶段 4.5.3：不再随请求发送供应商凭据（原供应商密钥请求头已移除）。
+        // 服务端 Provider 接入后，鉴权应由服务端会话/内部调用完成。
+        headers: { "Content-Type": "application/json" },
       });
     } catch (error) {
       if (attempt === maxAttempts) throw error;

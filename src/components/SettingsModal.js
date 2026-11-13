@@ -1,6 +1,7 @@
 import { LocalModelManager } from './LocalModelManager.js';
 import { isLocalAIAvailable } from '../lib/localInferenceClient.js';
 import { t } from '../lib/i18n.js';
+import { getProviderUnavailableMessage } from '../lib/providerAvailability.js';
 
 export function SettingsModal(onClose) {
     const overlay = document.createElement('div');
@@ -47,23 +48,21 @@ export function SettingsModal(onClose) {
     body.style.cssText = 'flex:1;overflow-y:auto;padding:1.5rem;';
     modal.appendChild(body);
 
-    // ── Tab: API Key ──────────────────────────────────────────────────────────
+    // ── Tab: API Key（阶段 4.5.3 起只展示服务端 Provider 状态，不再保存密钥）──
     const apiPanel = document.createElement('div');
     apiPanel.innerHTML = `
         <div style="display:flex;flex-direction:column;gap:0.75rem;">
             <div>
                 <label style="display:block;font-size:0.75rem;color:rgba(255,255,255,0.5);margin-bottom:0.4rem;font-weight:600;">${t('settings.muapiKeyLabel')}</label>
-                <input id="settings-api-key" type="password"
-                    style="width:100%;box-sizing:border-box;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);border-radius:0.75rem;padding:0.6rem 0.9rem;color:#fff;font-size:0.875rem;outline:none;"
-                    placeholder="${t('settings.keyPlaceholder')}"
-                    value="${localStorage.getItem('muapi_key') || ''}">
+                <p id="settings-provider-status" style="margin:0;padding:0.6rem 0.9rem;border-radius:0.75rem;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);color:rgba(255,255,255,0.75);font-size:0.8125rem;line-height:1.5;">
+                    ${getProviderUnavailableMessage()}
+                </p>
             </div>
             <p style="font-size:0.7rem;color:rgba(255,255,255,0.3);margin:0;">
                 ${t('settings.keyNote')}
             </p>
-            <div style="display:flex;justify-content:flex-end;gap:0.5rem;margin-top:0.5rem;">
+            <div style="display:flex;justify-content:flex-end;margin-top:0.5rem;">
                 <button id="settings-cancel-btn" style="padding:0.5rem 1rem;border-radius:0.5rem;background:none;border:1px solid rgba(255,255,255,0.1);color:rgba(255,255,255,0.6);font-size:0.75rem;font-weight:700;cursor:pointer;">${t('common.cancel')}</button>
-                <button id="settings-save-btn" style="padding:0.5rem 1rem;border-radius:0.5rem;background:var(--color-primary,#22d3ee);color:#000;font-size:0.75rem;font-weight:700;cursor:pointer;border:none;">${t('common.save')}</button>
             </div>
         </div>
     `;
@@ -93,22 +92,13 @@ export function SettingsModal(onClose) {
 
     switchTab('api');
 
-    // ── API key save/cancel handlers ──────────────────────────────────────────
+    // ── API 面板已是只读状态展示，不再有保存动作 ──────────────────────────────
     const close = () => {
         if (document.body.contains(overlay)) document.body.removeChild(overlay);
         if (onClose) onClose();
     };
 
     apiPanel.querySelector('#settings-cancel-btn').onclick = close;
-    apiPanel.querySelector('#settings-save-btn').onclick = () => {
-        const key = apiPanel.querySelector('#settings-api-key').value.trim();
-        if (key) {
-            localStorage.setItem('muapi_key', key);
-            close();
-        } else {
-            alert(t('settings.invalidKey'));
-        }
-    };
 
     header.querySelector('#settings-close-btn').onclick = close;
     overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });

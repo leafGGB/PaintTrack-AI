@@ -2,7 +2,7 @@
 import { muapi } from '../lib/muapi.js';
 import { CameraControls } from './CameraControls.js';
 import { buildNanoBananaPrompt, CAMERA_MAP, LENS_MAP, FOCAL_PERSPECTIVE, APERTURE_EFFECT } from '../lib/promptUtils.js';
-import { AuthModal } from './AuthModal.js';
+import { isClientProviderConfigured, notifyProviderUnavailable } from '../lib/providerAvailability.js';
 import { t } from '../lib/i18n.js';
 
 export function CinemaStudio() {
@@ -538,9 +538,9 @@ export function CinemaStudio() {
         const basePrompt = textarea.value.trim();
         if (!basePrompt) return;
 
-        const apiKey = localStorage.getItem('muapi_key');
-        if (!apiKey) {
-            AuthModal(() => generateBtn.click());
+        // 阶段 4.5.3：远程生成改为 fail-closed，浏览器不再读取或保存供应商密钥。
+        if (!isClientProviderConfigured()) {
+            notifyProviderUnavailable();
             return;
         }
 

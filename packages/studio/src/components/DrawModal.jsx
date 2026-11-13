@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from "react";
 import { uploadFile, generateI2I } from "../muapi.js";
+import ConfirmDialog from "./ui/ConfirmDialog.jsx";
 
 export default function DrawModal({
   isOpen,
@@ -918,23 +919,26 @@ export default function DrawModal({
   };
 
   // Clear Canvas (Remove image, drawings, text overlays and reset to setup screen)
+  // Confirmation is in-app (ConfirmDialog) rather than window.confirm(), which
+  // would render browser chrome on top of an already-portalled modal.
+  const [confirmClearOpen, setConfirmClearOpen] = useState(false);
+
   const handleClearCanvas = () => {
-    if (
-      confirm(
-        "Clear all drawings, text overlays, and remove the background image?",
-      )
-    ) {
-      const canvas = canvasRef.current;
-      if (canvas) {
-        const ctx = canvas.getContext("2d");
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-      }
-      setCanvasObjects([]);
-      setSelectedObjectId(null);
-      saveStateToHistory([]);
-      setBgImageUrl(null);
-      setViewState("setup");
+    setConfirmClearOpen(true);
+  };
+
+  const performClearCanvas = () => {
+    const canvas = canvasRef.current;
+    if (canvas) {
+      const ctx = canvas.getContext("2d");
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
     }
+    setCanvasObjects([]);
+    setSelectedObjectId(null);
+    saveStateToHistory([]);
+    setBgImageUrl(null);
+    setViewState("setup");
+    setConfirmClearOpen(false);
   };
 
   // Merge Layers and Trigger Generation
@@ -1889,6 +1893,17 @@ export default function DrawModal({
           </div>
         )}
       </div>
+
+      {/* ── CLEAR CANVAS CONFIRM (portals above this modal, z-1000) ── */}
+      <ConfirmDialog
+        open={confirmClearOpen}
+        title="Clear the canvas?"
+        description="All drawings, text overlays, and the background image will be removed. This cannot be undone."
+        confirmLabel="Clear"
+        cancelLabel="Cancel"
+        onConfirm={performClearCanvas}
+        onCancel={() => setConfirmClearOpen(false)}
+      />
     </div>
   );
 }

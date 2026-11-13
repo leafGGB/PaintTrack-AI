@@ -1,6 +1,14 @@
 import { t } from '../lib/i18n.js';
+import { getProviderUnavailableMessage } from '../lib/providerAvailability.js';
 
-export function AuthModal(onSuccess) {
+/**
+ * 阶段 4.5.3：原「填写供应商 API Key」登录弹窗已改为不可用提示。
+ *
+ * 浏览器不再保存或转发供应商凭据，因此这里不提供输入框、不写 localStorage。
+ * 保留函数签名与 onSuccess 参数，避免调用方需要同步改造；服务端 Provider
+ * 接入后，此入口应改为真正的账号登录，而不是粘贴密钥。
+ */
+export function AuthModal() {
     const overlay = document.createElement('div');
     overlay.className = 'fixed inset-0 z-[100] flex items-center justify-center bg-black/80 backdrop-blur-sm px-6';
 
@@ -13,44 +21,22 @@ export function AuthModal(onSuccess) {
                 <path d="M18 6L6 18M6 6l12 12" />
             </svg>
         </button>
-        <div class="flex flex-col items-center text-center mb-8">
+        <div class="flex flex-col items-center text-center mb-6">
             <div class="w-16 h-16 bg-primary/10 rounded-2xl flex items-center justify-center border border-primary/20 shadow-glow mb-6">
                 <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#22d3ee" stroke-width="2">
-                    <path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3m-3-3l-2.25-2.25"/>
+                    <rect x="3" y="11" width="18" height="10" rx="2" />
+                    <path d="M7 11V7a5 5 0 0 1 10 0v4" />
                 </svg>
             </div>
             <h2 class="text-2xl font-black text-white uppercase tracking-wider mb-2">${t('auth.title')}</h2>
-            <p class="text-secondary text-sm">${t('auth.subtitle')}</p>
+            <p class="text-secondary text-sm" id="auth-modal-message">${getProviderUnavailableMessage()}</p>
         </div>
-
-        <div class="space-y-6">
-            <div class="space-y-2">
-                <label class="text-[10px] font-bold text-muted uppercase tracking-widest ml-1">${t('auth.keyLabel')}</label>
-                <input
-                    type="password"
-                    id="muapi-key-input"
-                    placeholder="${t('auth.keyPlaceholder')}"
-                    class="w-full bg-black/40 border border-white/5 rounded-2xl px-5 py-4 text-white placeholder:text-muted focus:outline-none focus:border-primary/50 transition-colors shadow-inner"
-                >
-                <p class="text-[11px] text-muted ml-1">${t('auth.keyNote')}</p>
-            </div>
-
-            <div class="flex flex-col gap-3">
-                <button id="save-key-btn" class="w-full bg-primary text-black font-black py-4 rounded-2xl hover:shadow-glow hover:scale-[1.02] active:scale-[0.98] transition-all">
-                    ${t('auth.initBtn')}
-                </button>
-                <a href="https://muapi.ai/access-keys" target="_blank" rel="noreferrer" class="text-center text-[11px] font-bold text-muted hover:text-white transition-colors py-2 uppercase tracking-tighter">
-                    ${t('auth.createKey')}
-                </a>
-            </div>
-        </div>
+        <p class="text-[11px] text-muted text-center leading-relaxed">${t('auth.keyNote')}</p>
     `;
 
     overlay.appendChild(modal);
     document.body.appendChild(overlay);
 
-    const input = modal.querySelector('#muapi-key-input');
-    const btn = modal.querySelector('#save-key-btn');
     const closeBtn = modal.querySelector('#auth-modal-close-btn');
 
     const close = () => {
@@ -67,18 +53,6 @@ export function AuthModal(onSuccess) {
     overlay.addEventListener('click', (e) => {
         if (e.target === overlay) close();
     });
-
-    btn.onclick = () => {
-        const key = input.value.trim();
-        if (key) {
-            localStorage.setItem('muapi_key', key);
-            close();
-            if (onSuccess) onSuccess();
-        } else {
-            input.classList.add('border-red-500/50');
-            setTimeout(() => input.classList.remove('border-red-500/50'), 2000);
-        }
-    };
 
     return overlay;
 }

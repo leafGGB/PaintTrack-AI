@@ -89,21 +89,21 @@ const translations = {
 
         // Settings Modal
         'settings.title': 'Settings',
-        'settings.apiKey': 'API Key',
+        'settings.apiKey': 'Provider Status',
         'settings.localModels': 'Local Models',
-        'settings.muapiKeyLabel': 'Muapi API Key',
-        'settings.keyPlaceholder': 'Enter your Muapi API key...',
-        'settings.keyNote': 'Your API key is stored locally and never sent anywhere except api.muapi.ai.',
-        'settings.invalidKey': 'Please enter a valid API key.',
+        'settings.muapiKeyLabel': 'Server-side Provider',
+        'settings.keyPlaceholder': '',
+        'settings.keyNote': 'Provider credentials are configured on the server and are never stored in this browser.',
+        'settings.invalidKey': 'Provider is not configured on the server.',
 
         // Auth Modal
-        'auth.title': 'Muapi API Key Required',
-        'auth.subtitle': 'Create a Muapi access key, then paste the key value here to start creating high-aesthetic images.',
-        'auth.keyLabel': 'Muapi Access Key',
-        'auth.keyPlaceholder': 'Paste your access key value...',
-        'auth.keyNote': 'Do not enter the key name or label; paste the generated key value from Muapi.',
-        'auth.initBtn': 'Initialize Studio',
-        'auth.createKey': 'Create or copy a Muapi access key →',
+        'auth.title': 'Generation Unavailable',
+        'auth.subtitle': 'Generation runs on the server, so no key needs to be entered in the browser.',
+        'auth.keyLabel': 'Server-side Provider',
+        'auth.keyPlaceholder': '',
+        'auth.keyNote': 'This browser never stores or forwards provider credentials.',
+        'auth.initBtn': 'Unavailable',
+        'auth.createKey': 'Provider setup is documented in docs/records/DB_SETUP.md →',
 
         // Image Studio
         'image.title': 'Image Studio',
@@ -313,21 +313,21 @@ const translations = {
 
         // Settings Modal
         'settings.title': '设置',
-        'settings.apiKey': 'API 密钥',
+        'settings.apiKey': 'Provider 状态',
         'settings.localModels': '本地模型',
-        'settings.muapiKeyLabel': 'Muapi API 密钥',
-        'settings.keyPlaceholder': '输入您的 Muapi API 密钥...',
-        'settings.keyNote': '您的 API 密钥仅存储在本地，除 api.muapi.ai 外不会发送到任何地方。',
-        'settings.invalidKey': '请输入有效的 API 密钥。',
+        'settings.muapiKeyLabel': '服务端 Provider',
+        'settings.keyPlaceholder': '',
+        'settings.keyNote': '供应商凭据由服务端配置，浏览器不保存任何密钥。',
+        'settings.invalidKey': '服务端未配置 Provider。',
 
         // Auth Modal
-        'auth.title': '需要 Muapi API 密钥',
-        'auth.subtitle': '创建一个 Muapi 访问密钥，然后将密钥值粘贴到这里开始创建高质量图像。',
-        'auth.keyLabel': 'Muapi 访问密钥',
-        'auth.keyPlaceholder': '粘贴您的访问密钥值...',
-        'auth.keyNote': '请不要输入密钥名称或标签；粘贴从 Muapi 生成的密钥值。',
-        'auth.initBtn': '初始化工作室',
-        'auth.createKey': '创建或复制 Muapi 访问密钥 →',
+        'auth.title': '生成功能不可用',
+        'auth.subtitle': '生成请求由服务端发出，浏览器无需也无法填写密钥。',
+        'auth.keyLabel': '服务端 Provider',
+        'auth.keyPlaceholder': '',
+        'auth.keyNote': '本浏览器不会保存或转发任何供应商凭据。',
+        'auth.initBtn': '暂不可用',
+        'auth.createKey': 'Provider 配置方式见 docs/records/DB_SETUP.md →',
 
         // Image Studio
         'image.title': '图像工作室',

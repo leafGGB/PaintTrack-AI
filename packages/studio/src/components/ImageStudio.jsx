@@ -3,9 +3,11 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import toast, { Toaster } from "react-hot-toast";
 import { generateImage, generateI2I, uploadFile } from "../muapi.js";
+import { createImageTask, getImageTaskModel, waitForImageTask, deleteAsset, assetIdFromResultUrl } from "../taskClient.js";
 import { formatErrorMessage } from "../utils/formatError.js";
 import { scopedPersistKey, migrateLegacyPersistKey } from "../persistKey.js";
 import DrawModal from "./DrawModal.jsx";
+import ConfirmDialog from "./ui/ConfirmDialog.jsx";
 import ModelParameterControls from "./ModelParameterControls.jsx";
 import MobileGenerationActions, {
   GenerationCopyButtons,
@@ -968,6 +970,7 @@ function SimpleDropdown({ title, options, selected, onSelect, onClose }) {
 
 export default function ImageStudio({
   apiKey,
+  taskModelId = null,
   onGenerationStart,
   onGenerationEnd,
   onGenerationComplete,
@@ -1012,7 +1015,36 @@ export default function ImageStudio({
   const [dropdownOpen, setDropdownOpen] = useState(null); // 'model' | 'ar' | 'quality' | null
   const [generating, setGenerating] = useState(false);
   const [generateError, setGenerateError] = useState(null);
+  const [resolvedTaskModelId, setResolvedTaskModelId] = useState(taskModelId);
+  const [taskModelLoading, setTaskModelLoading] = useState(!taskModelId);
+  const [taskModelError, setTaskModelError] = useState(null);
   const [fullscreenUrl, setFullscreenUrl] = useState(null);
+
+  useEffect(() => {
+    if (taskModelId) {
+      setResolvedTaskModelId(taskModelId);
+      setTaskModelLoading(false);
+      setTaskModelError(null);
+      return undefined;
+    }
+    let active = true;
+    setTaskModelLoading(true);
+    getImageTaskModel()
+      .then((model) => {
+        if (!active) return;
+        setResolvedTaskModelId(model?.logicalModelId || null);
+        setTaskModelError(model ? null : "NO_IMAGE_TASK_MODEL");
+      })
+      .catch((error) => {
+        if (!active) return;
+        setResolvedTaskModelId(null);
+        setTaskModelError(error.code || "CATALOG_QUERY_FAILED");
+      })
+      .finally(() => {
+        if (active) setTaskModelLoading(false);
+      });
+    return () => { active = false; };
+  }, [taskModelId]);
   const [isDrawModalOpen, setIsDrawModalOpen] = useState(false);
 
   // ── Canvas / history state ──────────────────────────────────────────────
@@ -1020,6 +1052,13 @@ export default function ImageStudio({
   const [activeHistoryIdx, setActiveHistoryIdx] = useState(0);
   const [batchSize, setBatchSize] = useState(1);
   const [localHistory, setLocalHistory] = useState([]); // [{id,url,prompt,model,aspect_ratio,timestamp}]
+
+  // 删除确认走应用内的 ConfirmDialog，而不是浏览器原生 confirm：原生弹窗
+  // 会带出「<host> 显示」标题、按钮文案跟随浏览器语言、并且无法展示「删除中」
+  // 与失败原因（失败即丢弃上下文）。
+  const [pendingDelete, setPendingDelete] = useState(null); // { entry, idx }
+  const [deleteBusy, setDeleteBusy] = useState(false);
+  const [deleteError, setDeleteError] = useState(null);
 
   // Use prop history if provided, otherwise local
   const history = historyItems ?? localHistory;
@@ -1029,13 +1068,53 @@ export default function ImageStudio({
   // parent so it deletes server-side (UsageLog + S3) and updates the same
   // state `history` reads from. Falls back to the old local-only removal
   // when there's no server-backed list (e.g. standalone/embedded studio).
+  //
+  // PaintTrack 任务服务归档的图片另有归属：条目带 assetId（或 url 是
+  // /api/assets/<id>/content）时，必须先调用 DELETE /api/assets/:id 让服务端
+  // 软删除、内容地址立即失效，再从列表移除。服务端失败时保留条目，用户可以重试。
   const handleDeleteEntry = useCallback(async (entry, idx) => {
+    const assetId = entry?.assetId || assetIdFromResultUrl(entry?.url);
+    if (assetId) await deleteAsset(assetId);
     if (historyItems && onDeleteHistoryItem) {
       await onDeleteHistoryItem(entry);
     } else {
       setLocalHistory((prev) => prev.filter((_, i) => i !== idx));
     }
   }, [historyItems, onDeleteHistoryItem]);
+
+  const describeDeleteError = useCallback((err) => (
+    err?.code === "ASSET_NOT_DELETABLE"
+      ? copy.gallery.deleteNotReady
+      : formatErrorMessage(err, copy.gallery.deleteFailed)
+  ), [copy.gallery.deleteFailed, copy.gallery.deleteNotReady]);
+
+  // 打开确认弹窗（不立即发请求）。
+  const requestDelete = useCallback((entry, idx) => {
+    setDeleteError(null);
+    setPendingDelete({ entry, idx });
+  }, []);
+
+  // 取消：请求进行中不允许关闭，避免用户以为已中止而重复操作。
+  const cancelDelete = useCallback(() => {
+    if (deleteBusy) return;
+    setPendingDelete(null);
+    setDeleteError(null);
+  }, [deleteBusy]);
+
+  // 确认后才真正删除。失败保留弹窗并把原因显示在弹窗内，用户可重试或取消。
+  const confirmDelete = useCallback(async () => {
+    if (!pendingDelete || deleteBusy) return;
+    setDeleteBusy(true);
+    setDeleteError(null);
+    try {
+      await handleDeleteEntry(pendingDelete.entry, pendingDelete.idx);
+      setPendingDelete(null);
+    } catch (err) {
+      setDeleteError(describeDeleteError(err));
+    } finally {
+      setDeleteBusy(false);
+    }
+  }, [pendingDelete, deleteBusy, handleDeleteEntry, describeDeleteError]);
 
   // ── Refs ────────────────────────────────────────────────────────────────
   const textareaRef = useRef(null);
@@ -1357,6 +1436,13 @@ export default function ImageStudio({
   const handleGenerate = async () => {
     if (generating) return;
 
+    if (resolvedTaskModelId && imageMode) {
+      const message = "Image-to-image is not available through the task service yet.";
+      setGenerateError(message);
+      onGenerationError?.(message);
+      return;
+    }
+
     if (imageMode) {
       if (uploadedImageUrls.length === 0) {
         alert(copy.errors.uploadReferenceFirst);
@@ -1421,6 +1507,22 @@ export default function ImageStudio({
             if (currentQualityField && selectedQuality) {
               genParams[currentQualityField] = selectedQuality;
             }
+            if (taskModelLoading) throw new Error("IMAGE_MODEL_CATALOG_LOADING");
+            if (!resolvedTaskModelId) throw new Error(taskModelError || "IMAGE_TASK_MODEL_UNAVAILABLE");
+            {
+              const createdTask = await createImageTask({
+                logicalModelId: resolvedTaskModelId,
+                prompt: prompt.trim(),
+                aspectRatio: selectedAr,
+              });
+              const completedTask = await waitForImageTask(createdTask.id);
+              return {
+                id: completedTask.id,
+                assetId: completedTask.result.assetId
+                  || assetIdFromResultUrl(completedTask.result.resultUrl),
+                url: completedTask.result.resultUrl,
+              };
+            }
             return await generateImage(apiKey, genParams);
           }
         })
@@ -1430,6 +1532,7 @@ export default function ImageStudio({
         if (res && res.url) {
           const entry = {
             id: res.id || Math.random().toString(36).substring(7),
+            assetId: res.assetId || assetIdFromResultUrl(res.url),
             url: res.url,
             prompt: prompt.trim(),
             model: selectedModelId,
@@ -1447,7 +1550,9 @@ export default function ImageStudio({
       });
     } catch (e) {
       console.error("[ImageStudio] Generation failed:", e);
-      const errMsg = formatErrorMessage(e, copy.errors.generationFailed);
+      const errMsg = e?.code === "IMAGE_RESULT_NOT_AVAILABLE"
+        ? "The task completed, but its image has not been archived for preview yet."
+        : formatErrorMessage(e, copy.errors.generationFailed);
       if (onGenerationError) onGenerationError(errMsg);
       else toast.error(errMsg);
     } finally {
@@ -1469,6 +1574,13 @@ export default function ImageStudio({
       
       {/* ── CENTRAL GALLERY AREA ── */}
       <div className="flex-1 w-full max-w-7xl mx-auto overflow-y-auto custom-scrollbar pb-40 lg:pb-32 px-2">
+        {taskModelError && (
+          <div role="status" className="mx-auto mt-6 max-w-xl rounded-xl border border-amber-400/20 bg-amber-400/5 px-4 py-3 text-center text-sm text-amber-100/80">
+            {taskModelError === "NO_IMAGE_TASK_MODEL"
+              ? "No image generation model is available for this session."
+              : "The image model catalog is unavailable. Please sign in and try again."}
+          </div>
+        )}
         {history.length > 0 ? (
           <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-6 w-full pt-4 animate-fade-in-up">
             {history.map((entry, idx) => (
@@ -1508,11 +1620,7 @@ export default function ImageStudio({
                     title={copy.gallery.delete}
                     onClick={(e) => {
                       e.stopPropagation();
-                      if (confirm(copy.gallery.deleteConfirm)) {
-                        handleDeleteEntry(entry, idx).catch((err) => {
-                          onGenerationError?.(err.message || copy.gallery.deleteFailed);
-                        });
-                      }
+                      requestDelete(entry, idx);
                     }}
                     className="p-2 bg-black/60 backdrop-blur-md rounded-full text-red-400 hover:bg-red-500 hover:text-white transition-all border border-white/10"
                   >
@@ -1539,13 +1647,7 @@ export default function ImageStudio({
                       kind: "delete",
                       label: copy.gallery.delete,
                       danger: true,
-                      onSelect: () => {
-                        if (confirm(copy.gallery.deleteConfirm)) {
-                          handleDeleteEntry(entry, idx).catch((err) => {
-                            onGenerationError?.(err.message || copy.gallery.deleteFailed);
-                          });
-                        }
-                      },
+                      onSelect: () => requestDelete(entry, idx),
                     },
                   ]}
                 />
@@ -1887,7 +1989,7 @@ export default function ImageStudio({
             {/* Generate button */}
             <PromptAction
               onClick={handleGenerate}
-              disabled={generating}
+              disabled={generating || taskModelLoading || !resolvedTaskModelId}
             >
               {generating ? (
                 <>
@@ -1939,6 +2041,20 @@ export default function ImageStudio({
         batchSize={1}
         onAddHistoryItem={addToHistory}
       />
+      {/* ── DELETE CONFIRM ── */}
+      <ConfirmDialog
+        open={Boolean(pendingDelete)}
+        title={copy.gallery.deleteTitle}
+        description={copy.gallery.deleteDescription}
+        confirmLabel={copy.gallery.deleteAction}
+        cancelLabel={copy.gallery.deleteCancel}
+        busyLabel={copy.gallery.deleteBusy}
+        busy={deleteBusy}
+        error={deleteError}
+        onConfirm={confirmDelete}
+        onCancel={cancelDelete}
+      />
+
       <Toaster position="top-right" containerStyle={{ zIndex: 99999 }} toastOptions={{ duration: 5000, style: { background: '#18181b', color: '#ffffff', border: '1px solid rgba(255,255,255,0.15)', fontSize: '13px', borderRadius: '12px', boxShadow: '0 10px 30px rgba(0,0,0,0.6)', maxWidth: '440px', wordBreak: 'break-word', whiteSpace: 'pre-wrap', padding: '12px 16px' } }} />
     </div>
   );

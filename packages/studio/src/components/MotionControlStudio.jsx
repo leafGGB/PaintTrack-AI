@@ -33,6 +33,8 @@ import {
 } from "./prompt/PromptComposer.jsx";
 import en from "../messages/en/motionControlStudio.json";
 import zh from "../messages/zh/motionControlStudio.json";
+import ConfirmDialog from "./ui/ConfirmDialog.jsx";
+import { getConfirmCopy } from "../confirmCopy.js";
 import { resolveCopy } from "../i18nUtils";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -556,6 +558,7 @@ export default function MotionControlStudio({
   locale = "en",
 }) {
   const copy = resolveCopy(en, zh, locale);
+  const confirmCopy = getConfirmCopy(locale);
   const LEGACY_PERSIST_KEY = "hg_motion_control_studio_persistent";
   const PERSIST_KEY = scopedPersistKey(LEGACY_PERSIST_KEY, apiKey);
 
@@ -620,6 +623,8 @@ export default function MotionControlStudio({
 
   // ── History & Gallery ───────────────────────────────────────────────────────
   const [history, setHistory] = useState([]);
+  // Deletion goes through the in-app ConfirmDialog instead of window.confirm().
+  const [pendingDeleteIdx, setPendingDeleteIdx] = useState(null);
   const [fullscreenUrl, setFullscreenUrl] = useState(null);
 
   // ── Asset Library Storage ───────────────────────────────────────────────────
@@ -943,9 +948,7 @@ export default function MotionControlStudio({
                     title={copy.buttons.delete}
                     onClick={(e) => {
                       e.stopPropagation();
-                      if (confirm(copy.confirm.deleteGenerated)) {
-                        saveHistory(history.filter((_, i) => i !== idx));
-                      }
+                      setPendingDeleteIdx(idx);
                     }}
                     className="p-2 bg-black/60 backdrop-blur-md rounded-full text-red-400 hover:bg-red-500 hover:text-white transition-all border border-white/10"
                   >
@@ -970,9 +973,7 @@ export default function MotionControlStudio({
                       label: copy.buttons.delete,
                       danger: true,
                       onSelect: () => {
-                        if (confirm(copy.confirm.deleteGenerated)) {
-                          saveHistory(history.filter((_, i) => i !== idx));
-                        }
+                        setPendingDeleteIdx(idx);
                       },
                     },
                   ]}
@@ -1437,6 +1438,20 @@ export default function MotionControlStudio({
           </div>
         </div>
       )}
+
+      {/* ── DELETE CONFIRM ── */}
+      <ConfirmDialog
+        open={pendingDeleteIdx !== null}
+        title={confirmCopy.deleteTitle}
+        description={confirmCopy.deleteDescription}
+        confirmLabel={confirmCopy.deleteAction}
+        cancelLabel={confirmCopy.deleteCancel}
+        onConfirm={() => {
+          saveHistory(history.filter((_, i) => i !== pendingDeleteIdx));
+          setPendingDeleteIdx(null);
+        }}
+        onCancel={() => setPendingDeleteIdx(null)}
+      />
     </div>
   );
 }

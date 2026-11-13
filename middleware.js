@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import { getLocaleFromPathname } from './lib/locales';
+import { getRequestId } from './lib/server/observability.js';
 
 function addSecurityHeaders(response) {
     // Prevent MIME type sniffing (CWE-693)
@@ -10,44 +11,41 @@ function addSecurityHeaders(response) {
     response.headers.set('X-XSS-Protection', '1; mode=block');
     // Referrer policy
     response.headers.set('Referrer-Policy', 'strict-origin-when-cross-origin');
-    // Content Security Policy - restricts script sources to prevent XSS (CWE-79).
-    // connect-src covers *.muapi.ai (not just api.muapi.ai) because generated
-    // media, model thumbnails, and other assets are served from cdn.muapi.ai
-    // and other muapi subdomains that the renderer fetches directly.
+    // Web云端请求只能访问同源门禁；Electron独立Vite/IPC本地推理不经过此middleware。
     response.headers.set(
         'Content-Security-Policy',
-        "default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; media-src 'self' data: blob: https:; connect-src 'self' https://muapi.ai https://*.muapi.ai; font-src 'self' data:;"
+        "default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; media-src 'self' data: blob: https:; connect-src 'self'; font-src 'self' data:;"
     );
     return response;
 }
 
 export function middleware(request) {
     const url = request.nextUrl;
-
-    // Catch requests to /api/workflow, /api/app, and /api/v1
-    const isMuApi = url.pathname.startsWith('/api/workflow') ||
-                    url.pathname.startsWith('/api/app') ||
-                    url.pathname.startsWith('/api/v1');
-
-    if (isMuApi) {
-        // Exclude paths that have their own dedicated route handlers with custom logic
-        const isHandledByRoute = url.pathname.startsWith('/api/v1/creative-agent') ||
-                                url.pathname.startsWith('/api/v1/get_upload_url') ||
-                                url.pathname.startsWith('/api/v1/upload-binary');
-
-        if (url.pathname.startsWith('/api/v1') && !isHandledByRoute) {
-            const targetUrl = new URL(url.pathname + url.search, 'https://api.muapi.ai');
-            const rewriteResponse = NextResponse.rewrite(targetUrl);
-            return addSecurityHeaders(rewriteResponse);
-        }
+    if (process.env.PAINTTRACK_LOCAL_INTERNAL_GUARD === '1'
+        && request.headers.get('x-painttrack-local-capability') !== process.env.PAINTTRACK_LOCAL_MAILBOX_SECRET) {
+        return new NextResponse('Local development access only', {
+            status: 403,
+            headers: { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' },
+        });
     }
+    const requestId = getRequestId(request.headers.get('x-request-id'));
+    const requestHeaders = new Headers(request.headers);
+    requestHeaders.set('x-request-id', requestId);
+
+    // API 授权由 Node Route Handler 查询实时数据库执行，禁止外部 rewrite 绕过。
 
     // Plain response header carrying the locale derived from the URL path
     // (same "set in middleware, read via headers() in the root layout"
     // trick the main muapi client uses — see docs/localization.md).
-    const response = NextResponse.next();
+    const response = NextResponse.next({ request: { headers: requestHeaders } });
     response.headers.set('x-locale', getLocaleFromPathname(url.pathname));
-    return addSecurityHeaders(response);
+    response.headers.set('x-request-id', requestId);
+    addSecurityHeaders(response);
+    if (['/register', '/verify-email', '/login', '/account', '/zh/account', '/dev/mailbox', '/dev/authorization'].includes(url.pathname) || url.pathname.startsWith('/api/auth/') || url.pathname.startsWith('/api/dev/mailbox')) {
+        response.headers.set('Referrer-Policy', 'no-referrer');
+        response.headers.set('Cache-Control', 'no-store');
+    }
+    return response;
 }
 
 // Match all paths for security headers. Exclude Next.js internal paths.

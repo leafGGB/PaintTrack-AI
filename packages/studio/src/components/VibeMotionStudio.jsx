@@ -8,6 +8,8 @@ import { scopedPersistKey, migrateLegacyPersistKey } from "../persistKey.js";
 import MobileGenerationActions, {
   GenerationCopyButtons,
 } from "./MobileGenerationActions.jsx";
+import ConfirmDialog from "./ui/ConfirmDialog.jsx";
+import { getConfirmCopy } from "../confirmCopy.js";
 import {
   PROMPT_CONTROL_LABEL_CLASS,
   PromptAspectRatioIcon,
@@ -80,6 +82,7 @@ export default function VibeMotionStudio({
   locale = "en",
 }) {
   const copy = resolveCopy(en, zh, locale);
+  const confirmCopy = getConfirmCopy(locale);
   const LEGACY_PERSIST_KEY = "hg_vibe_motion_studio_persistent";
   const PERSIST_KEY = scopedPersistKey(LEGACY_PERSIST_KEY, apiKey);
   useEffect(() => {
@@ -110,6 +113,10 @@ export default function VibeMotionStudio({
   // ── History ───────────────────────────────────────────────────────────────
   const [history, setHistory] = useState([]);
   const [fullscreenUrl, setFullscreenUrl] = useState(null);
+  // Deletion goes through the in-app ConfirmDialog instead of window.confirm():
+  // the native dialog carries browser chrome ("<host> says"), localizes its
+  // buttons to the browser locale, and cannot show an in-flight state.
+  const [pendingDeleteIdx, setPendingDeleteIdx] = useState(null);
 
   // ── Load from localStorage ─────────────────────────────────────────────────
   useEffect(() => {
@@ -392,9 +399,7 @@ export default function VibeMotionStudio({
                     title={copy.card.delete}
                     onClick={(e) => {
                       e.stopPropagation();
-                      if (confirm(copy.card.confirmDelete)) {
-                        setHistory(prev => prev.filter((_, i) => i !== idx));
-                      }
+                      setPendingDeleteIdx(idx);
                     }}
                     className="p-2 bg-black/60 backdrop-blur-md rounded-full text-red-400 hover:bg-red-500 hover:text-white transition-all border border-white/10"
                   >
@@ -432,9 +437,7 @@ export default function VibeMotionStudio({
                       label: copy.mobileActions.delete,
                       danger: true,
                       onSelect: () => {
-                        if (confirm(copy.card.confirmDelete)) {
-                          setHistory((prev) => prev.filter((_, i) => i !== idx));
-                        }
+                        setPendingDeleteIdx(idx);
                       },
                     },
                   ]}
@@ -715,6 +718,20 @@ export default function VibeMotionStudio({
             </PromptAction>
           </PromptFooter>
       </PromptComposer>
+      {/* ── DELETE CONFIRM ── */}
+      <ConfirmDialog
+        open={pendingDeleteIdx !== null}
+        title={confirmCopy.deleteTitle}
+        description={confirmCopy.deleteDescription}
+        confirmLabel={confirmCopy.deleteAction}
+        cancelLabel={confirmCopy.deleteCancel}
+        onConfirm={() => {
+          setHistory((prev) => prev.filter((_, i) => i !== pendingDeleteIdx));
+          setPendingDeleteIdx(null);
+        }}
+        onCancel={() => setPendingDeleteIdx(null)}
+      />
+
       <Toaster position="top-right" containerStyle={{ zIndex: 99999 }} toastOptions={{ duration: 5000, style: { background: '#18181b', color: '#ffffff', border: '1px solid rgba(255,255,255,0.15)', fontSize: '13px', borderRadius: '12px', boxShadow: '0 10px 30px rgba(0,0,0,0.6)', maxWidth: '440px', wordBreak: 'break-word', whiteSpace: 'pre-wrap', padding: '12px 16px' } }} />
     </div>
   );

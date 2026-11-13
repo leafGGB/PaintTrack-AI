@@ -1,5 +1,5 @@
 import { muapi } from '../lib/muapi.js';
-import { AuthModal } from './AuthModal.js';
+import { isClientProviderConfigured, notifyProviderUnavailable } from '../lib/providerAvailability.js';
 import { getUploadHistory, saveUpload, removeUpload, generateThumbnail } from '../lib/uploadHistory.js';
 
 /**
@@ -14,9 +14,9 @@ import { getUploadHistory, saveUpload, removeUpload, generateThumbnail } from '.
  * @returns {{ trigger: HTMLElement, panel: HTMLElement, reset: function, setMaxImages: function }}
  */
 export function createUploadPicker({ anchorContainer, onSelect, onClear, maxImages: initialMaxImages = 1, uploadFn, requireApiKey }) {
-    // uploadFn(file) → Promise<string url>. Defaults to Muapi-hosted upload.
-    // requireApiKey() → boolean. Lets the caller suppress the AuthModal when
-    // the active provider doesn't need a Muapi key (e.g. local Wan2GP).
+    // uploadFn(file) → Promise<string url>. Defaults to Muapi-hosted upload (fail-closed in 4.5.3).
+    // requireApiKey() → boolean. Kept for call-site compatibility: it now describes whether the
+    // upload needs a server-side provider (local providers such as Wan2GP pass false).
     const doUpload = uploadFn || ((file) => muapi.uploadFile(file));
     const needsKey = typeof requireApiKey === 'function' ? requireApiKey : () => true;
     let panelOpen = false;
@@ -323,12 +323,10 @@ export function createUploadPicker({ anchorContainer, onSelect, onClear, maxImag
         const files = Array.from(e.target.files);
         if (!files.length) return;
 
-        if (needsKey()) {
-            const apiKey = localStorage.getItem('muapi_key');
-            if (!apiKey) {
-                AuthModal(() => fileInput.click());
-                return;
-            }
+        if (needsKey() && !isClientProviderConfigured()) {
+            // 阶段 4.5.3：远程上传需要服务端 Provider，浏览器不再持有凭据。
+            notifyProviderUnavailable();
+            return;
         }
 
         showSpinner();

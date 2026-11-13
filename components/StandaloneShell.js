@@ -1,16 +1,14 @@
 'use client';
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import dynamic from 'next/dynamic';
-import { ImageStudio, VideoStudio, ClippingStudio, MotionControlStudio, VibeMotionStudio, LipSyncStudio, RecastStudio, CinemaStudio, AudioStudio, MarketingStudio, WorkflowStudio, AgentStudio, AppsStudio, AiInfluencerStudio, LayersStudio, getUserBalance } from 'studio';
+import { ImageStudio, VideoStudio, ClippingStudio, MotionControlStudio, VibeMotionStudio, LipSyncStudio, RecastStudio, CinemaStudio, AudioStudio, MarketingStudio, WorkflowStudio, AgentStudio, AppsStudio, AiInfluencerStudio, LayersStudio } from 'studio';
 
 const DesignAgentStudio = dynamic(() => import('studio').then(mod => mod.DesignAgentStudio), {
   ssr: false,
   loading: () => <div className="h-full w-full bg-black flex items-center justify-center text-white/20">Loading Design Studio...</div>
 });
-import axios from 'axios';
-import ApiKeyModal from './ApiKeyModal';
 import { getCommonCopy, getLocaleConfig, localizeStudioPath } from '@/lib/locales';
 
 // Tab/category ids, icons, and English `label` fallbacks are stable
@@ -266,7 +264,8 @@ const getNavigationCategory = (tabId) => (
   NAVIGATION_CATEGORIES.find((category) => category.tabIds.includes(tabId))
 );
 
-const STORAGE_KEY = 'muapi_key';
+// 阶段 4.5.3：浏览器侧不再有任何供应商凭据存储键。
+// 旧的本地密钥存储键已移除；生成能力只能由服务端 Provider 提供。
 const NOTIFICATIONS_STORAGE_KEY = 'open_gen_notifications_v1';
 const MAX_VISIBLE_NOTIFICATIONS = 3;
 
@@ -342,16 +341,15 @@ export default function StandaloneShell({ locale = 'en' }) {
   };
   
   const [apiKey, setApiKey] = useState(null);
+  const [authStatus, setAuthStatus] = useState('checking');
+  const [currentUser, setCurrentUser] = useState(null);
+  const [logoutStatus, setLogoutStatus] = useState('idle');
+  const accountMenuRef = useRef(null);
   const [activeTab, setActiveTab] = useState(getInitialTab());
 
-  const [balance, setBalance] = useState(null);
   const [showSettings, setShowSettings] = useState(false);
   const [isHeaderVisible, setIsHeaderVisible] = useState(true);
   const [hasMounted, setHasMounted] = useState(false);
-  const [showVadooBanner, setShowVadooBanner] = useState(() => {
-    if (typeof window !== 'undefined') return localStorage.getItem('vadoo_banner_dismissed') !== '1';
-    return true;
-  });
 
   // Sidebar Collapsed & Mobile Drawer State
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(() => {
@@ -402,6 +400,37 @@ export default function StandaloneShell({ locale = 'en' }) {
   const [generationCounts, setGenerationCounts] = useState({});
 
   useEffect(() => {
+    let active = true;
+
+    fetch('/api/auth/me', { cache: 'no-store', credentials: 'same-origin' })
+      .then(async (response) => {
+        if (!response.ok) throw new Error('AUTH_UNAVAILABLE');
+        const result = await response.json();
+        if (!active) return;
+        if (result.user) {
+          if (result.user.role === 'admin' && result.user.authLevel !== 'mfa') {
+            const accountPath = locale === 'zh' ? '/zh/account' : '/account';
+            const nextPath = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+            window.location.replace(`${accountPath}?next=${encodeURIComponent(nextPath)}`);
+            return;
+          }
+          setCurrentUser(result.user);
+          setAuthStatus('authenticated');
+          return;
+        }
+
+        setAuthStatus('unauthenticated');
+        const nextPath = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+        window.location.replace(`/login?next=${encodeURIComponent(nextPath)}`);
+      })
+      .catch(() => {
+        if (active) setAuthStatus('error');
+      });
+
+    return () => { active = false; };
+  }, [locale]);
+
+  useEffect(() => {
     setNotifications(loadStoredNotifications());
     setNotificationsHydrated(true);
   }, []);
@@ -447,13 +476,38 @@ export default function StandaloneShell({ locale = 'en' }) {
     return () => window.clearTimeout(timer);
   }, [notifications]);
 
-  const fetchBalance = useCallback(async (key) => {
+  const accountPath = locale === 'zh' ? '/zh/account' : '/account';
+
+  const handleLogout = useCallback(async () => {
+    setLogoutStatus('busy');
     try {
-      const data = await getUserBalance(key);
-      setBalance(data.balance);
-    } catch (err) {
-      console.error('Balance fetch failed:', err);
+      const response = await fetch('/api/auth/logout', { method: 'POST', credentials: 'same-origin' });
+      if (response.status !== 204) throw new Error('LOGOUT_UNAVAILABLE');
+      window.location.replace('/login');
+    } catch {
+      setLogoutStatus('error');
     }
+  }, []);
+
+  useEffect(() => {
+    const closeAccountMenuOnOutsidePointer = (event) => {
+      const menu = accountMenuRef.current;
+      if (!menu?.open || menu.contains(event.target)) return;
+      menu.open = false;
+    };
+    const closeAccountMenuOnEscape = (event) => {
+      const menu = accountMenuRef.current;
+      if (event.key !== 'Escape' || !menu?.open) return;
+      menu.open = false;
+      menu.querySelector('summary')?.focus();
+    };
+
+    document.addEventListener('pointerdown', closeAccountMenuOnOutsidePointer);
+    document.addEventListener('keydown', closeAccountMenuOnEscape);
+    return () => {
+      document.removeEventListener('pointerdown', closeAccountMenuOnOutsidePointer);
+      document.removeEventListener('keydown', closeAccountMenuOnEscape);
+    };
   }, []);
 
   const makeSuccessCallback = useCallback((tabId) => (data) => {
@@ -472,8 +526,7 @@ export default function StandaloneShell({ locale = 'en' }) {
       ? errorOrMessage
       : (errorOrMessage?.message || errorOrMessage?.error || String(errorOrMessage || 'Generation failed'));
     pushNotification({ type: 'error', tabId, label: tab?.label || tabId, message });
-    if (apiKey) void fetchBalance(apiKey);
-  }, [apiKey, fetchBalance, pushNotification]);
+  }, [pushNotification]);
 
   const makeGenerationStartCallback = useCallback((tabId) => () => {
     setGenerationCounts((previous) => ({
@@ -576,60 +629,14 @@ export default function StandaloneShell({ locale = 'en' }) {
 
   useEffect(() => {
     setHasMounted(true);
-    const stored = localStorage.getItem(STORAGE_KEY);
-    if (stored) {
-      setApiKey(stored);
-      fetchBalance(stored);
-      // Sync cookie immediately on mount to establish identity for background requests
-      document.cookie = `muapi_key=${stored}; path=/; max-age=31536000; SameSite=Lax`;
-    }
-  }, [fetchBalance]);
-
-  const handleKeySave = useCallback((key) => {
-    localStorage.setItem(STORAGE_KEY, key);
-    setApiKey(key);
-    fetchBalance(key);
-    document.cookie = `muapi_key=${key}; path=/; max-age=31536000; SameSite=Lax`;
-  }, [fetchBalance]);
-
-  const handleKeyChange = useCallback(() => {
-    localStorage.removeItem(STORAGE_KEY);
+    // 阶段 4.5.3：不再从 localStorage 恢复任何供应商密钥，也不再写 cookie。
+    // 显式清空状态，避免任何历史值经由 state 回流到下游组件。
     setApiKey(null);
-    setBalance(null);
-    document.cookie = "muapi_key=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT";
   }, []);
 
-  // Inject API key into all outgoing Axios requests (prop-based approach)
-  // We use an interceptor to be selective and NOT send the key to external domains like S3
-  useEffect(() => {
-    // Safety: Clear any global defaults that might have been set previously
-    delete axios.defaults.headers.common['x-api-key'];
-
-    if (!apiKey) return;
-
-    const interceptorId = axios.interceptors.request.use((config) => {
-      // Check if URL is local/proxied
-      const isRelative = config.url.startsWith('/') || !config.url.startsWith('http');
-      const isInternalProxy = config.url.includes('/api/app') || config.url.includes('/api/workflow') || config.url.includes('/api/agents') || config.url.includes('/api/api') || config.url.includes('/api/v1');
-
-      if (isRelative || isInternalProxy) {
-        config.headers['x-api-key'] = apiKey;
-      }
-      
-      return config;
-    });
-
-    return () => {
-      axios.interceptors.request.eject(interceptorId);
-    };
-  }, [apiKey]);
-
-  // Poll for balance every 30 seconds if key is present
-  useEffect(() => {
-    if (!apiKey) return;
-    const interval = setInterval(() => fetchBalance(apiKey), 30000);
-    return () => clearInterval(interval);
-  }, [apiKey, fetchBalance]);
+  // 阶段 4.5.3：移除了 axios 请求拦截器与余额轮询。
+  // 旧实现把浏览器里的供应商密钥注入所有内部代理请求，并周期性向供应商查询余额；
+  // 两者都以「浏览器持有凭据」为前提，与阶段 4 Provider 契约冲突。
 
   // Drag and Drop Handlers
   const handleDragOver = useCallback((e) => {
@@ -669,15 +676,16 @@ export default function StandaloneShell({ locale = 'en' }) {
     setDroppedFiles(null);
   }, []);
 
-  if (!hasMounted) return (
+  if (!hasMounted || authStatus !== 'authenticated') return (
     <div className="min-h-screen bg-[#050505] flex items-center justify-center">
-      <div className="animate-spin text-[#22d3ee] text-3xl">◌</div>
+      {authStatus === 'error'
+        ? <p role="alert" className="text-sm text-white/70">暂时无法验证登录状态，请刷新页面重试。</p>
+        : <div role="status" aria-label="正在验证登录状态" className="animate-spin text-[#22d3ee] text-3xl">◌</div>}
     </div>
   );
 
-  if (!apiKey) {
-    return <ApiKeyModal onSave={handleKeySave} locale={locale} />;
-  }
+  // Provider 是否可用只影响生成调用；未配置时保留完整工作区和导航，
+  // 具体生成操作由各 Studio 的 fail-closed 检查拒绝，不替换整站页面。
 
   return (
     <div 
@@ -701,30 +709,6 @@ export default function StandaloneShell({ locale = 'en' }) {
               <span className="text-sm text-white/40">{copy.shell.dropHereHint}</span>
             </div>
           </div>
-        </div>
-      )}
-
-      {/* Vadoo promo banner */}
-      {showVadooBanner && (
-        <div className="flex-shrink-0 w-full bg-indigo-600 flex items-center justify-center px-4 py-2 gap-3 relative z-50">
-          <a
-            href="https://vadoo.tv"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="text-[13px] font-bold text-white hover:opacity-80 transition-opacity text-center"
-          >
-            {copy.shell.vadooPromo}
-          </a>
-          <button
-            onClick={() => {
-              setShowVadooBanner(false);
-              localStorage.setItem('vadoo_banner_dismissed', '1');
-            }}
-            className="absolute right-3 text-white/60 hover:text-white transition-colors text-lg leading-none"
-            aria-label={copy.shell.dismiss}
-          >
-            ✕
-          </button>
         </div>
       )}
 
@@ -796,12 +780,25 @@ export default function StandaloneShell({ locale = 'en' }) {
 
           {/* Right: Actions */}
           <div className="flex-shrink-0 flex items-center gap-3">
-            <div className="flex items-center gap-2.5 bg-white/5 px-3 py-1.5 rounded-full border border-white/5 transition-colors">
-              <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
-              <span className="text-xs font-bold text-white/90">
-                ${balance !== null ? `${balance}` : '---'}
-              </span>
-            </div>
+            <details ref={accountMenuRef} className="relative">
+              <summary
+                aria-label={copy.account.menuLabel}
+                className="flex h-9 max-w-[220px] cursor-pointer list-none items-center gap-2 rounded-md border border-white/10 bg-white/5 px-2.5 text-[13px] font-semibold text-white/80 transition-colors hover:border-cyan-300/30 hover:bg-white/10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-cyan-300 sm:px-3 [&::-webkit-details-marker]:hidden"
+              >
+                <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full border border-cyan-300/20 bg-cyan-300/10 text-[11px] font-semibold text-cyan-100" aria-hidden="true">{currentUser?.email?.[0]?.toUpperCase() || 'U'}</span>
+                <span className="hidden max-w-[150px] truncate sm:inline">{currentUser?.email || copy.account.openCenter}</span>
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="m7 10 5 5 5-5" /></svg>
+              </summary>
+              <div className="absolute right-0 top-full z-[120] mt-2 w-64 overflow-hidden rounded-lg border border-white/10 bg-[#0c0c0e] p-1.5 shadow-2xl">
+                <div className="border-b border-white/[0.07] px-3 py-2.5">
+                  <p className="text-[10px] font-medium uppercase tracking-[0.12em] text-white/35">{copy.account.signedInAs}</p>
+                  <p className="mt-1 truncate text-xs text-white/75">{currentUser?.email}</p>
+                </div>
+                <a href={accountPath} className="mt-1 flex min-h-10 items-center rounded-md px-3 text-[13px] text-white/75 transition-colors hover:bg-white/[0.06] hover:text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-cyan-300">{copy.account.openCenter}</a>
+                <button type="button" onClick={handleLogout} disabled={logoutStatus === 'busy'} className="flex min-h-10 w-full items-center rounded-md px-3 text-left text-[13px] text-white/60 transition-colors hover:bg-white/[0.06] hover:text-white disabled:cursor-wait disabled:opacity-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-cyan-300">{logoutStatus === 'busy' ? copy.account.signingOut : copy.account.signOut}</button>
+                {logoutStatus === 'error' && <p role="alert" className="px-3 pb-2 text-xs text-rose-200">{copy.account.signOutError}</p>}
+              </div>
+            </details>
 
             <button
               onClick={() => setShowSettings(true)}
@@ -1187,18 +1184,13 @@ export default function StandaloneShell({ locale = 'en' }) {
                    {copy.settingsModal.activeApiKey}
                 </label>
                 <div className="text-[13px] font-mono text-white/80">
-                  {apiKey.slice(0, 8)}••••••••••••••••
+                  {/* 阶段 4.5.3：浏览器不持有凭据，因此不再显示任何密钥片段 */}
+                  server-side only
                 </div>
               </div>
             </div>
 
             <div className="flex gap-3">
-              <button
-                onClick={handleKeyChange}
-                className="flex-1 h-10 rounded-md bg-red-500/10 text-red-400 hover:bg-red-500/20 text-xs font-semibold transition-all"
-              >
-                {copy.settingsModal.changeKey}
-              </button>
               <button
                 onClick={() => setShowSettings(false)}
                 className="flex-1 h-10 rounded-md bg-white/5 text-white/80 hover:bg-white/10 text-xs font-semibold transition-all border border-white/5"

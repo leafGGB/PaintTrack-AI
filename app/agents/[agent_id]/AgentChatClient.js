@@ -2,60 +2,17 @@
 
 import { AiAgent } from "ai-agent";
 import "ai-agent/dist/tailwind.css";
-import { useCallback, useEffect, useRef } from "react";
-import axios from "axios";
-
-const STORAGE_KEY = "muapi_key";
+import { useCallback } from "react";
 
 /**
  * AgentChatClient — mirrors muapiapp's AgentClient.js.
  * Renders the AiAgent library component with server-fetched agent details
  * and optional initial history.
  *
- * IMPORTANT: StandaloneShell is NOT in the tree on /agents/* pages, so we
- * must set up our own axios interceptor here to inject the API key into
- * all requests made by the AiAgent library.
+ * 阶段 4.5.3：不再从 localStorage / cookie 读取供应商密钥，也不再向内部代理
+ * 注入供应商密钥请求头。供应商凭据只存在于服务端（lib/server/providers/providerConfig.js）。
  */
 export default function AgentChatClient({ agentDetails, initialHistory, userData }) {
-  const interceptorRef = useRef(null);
-
-  console.log("[AgentChatClient] Rendering", { 
-    hasAgentDetails: !!agentDetails, 
-    hasHistory: !!initialHistory, 
-    hasUserData: !!userData 
-  });
-
-  useEffect(() => {
-    const getKey = () => {
-      if (typeof window === "undefined") return null;
-      const fromStorage = localStorage.getItem(STORAGE_KEY);
-      if (fromStorage) return fromStorage;
-      const match = document.cookie.match(/muapi_key=([^;]+)/);
-      return match ? match[1] : null;
-    };
-
-    const apiKey = getKey();
-    if (!apiKey) return;
-
-    interceptorRef.current = axios.interceptors.request.use((config) => {
-      const isRelative =
-        config.url.startsWith("/") || !config.url.startsWith("http");
-      // Include specific proxy paths to be sure
-      const isInternalProxy = config.url.includes('/api/app') || config.url.includes('/api/workflow') || config.url.includes('/api/agents') || config.url.includes('/api/api') || config.url.includes('/api/v1');
-      
-      if (isRelative || isInternalProxy) {
-        config.headers["x-api-key"] = apiKey;
-      }
-      return config;
-    });
-
-    return () => {
-      if (interceptorRef.current !== null) {
-        axios.interceptors.request.eject(interceptorRef.current);
-      }
-    };
-  }, []);
-
   const useUser = useCallback(
     () => ({
       user: {

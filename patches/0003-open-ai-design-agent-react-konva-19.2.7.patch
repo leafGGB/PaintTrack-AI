@@ -1,0 +1,40 @@
+diff --git a/client/package.json b/client/package.json
+index 40e42c6..22609ab 100644
+--- a/client/package.json
++++ b/client/package.json
+@@ -21,7 +21,7 @@
+     "react-dom": "19.2.4",
+     "react-hot-toast": "^2.6.0",
+     "react-icons": "^5.6.0",
+-    "react-konva": "^19.2.3",
++    "react-konva": "19.2.7",
+     "react-markdown": "^10.1.0",
+     "remark-gfm": "^4.0.1",
+     "tailwind-merge": "^3.5.0",
+diff --git a/package.json b/package.json
+index 970bd7c..d023610 100644
+--- a/package.json
++++ b/package.json
+@@ -12,5 +12,9 @@
+     "build:app": "npm run build -w client",
+     "build:lib": "npm run build -w packages/design-agent",
+     "install:all": "npm install"
++  },
++  "dependencies": {
++    "konva": "^10.9.1",
++    "react-konva": "^19.2.7"
+   }
+ }
+diff --git a/packages/design-agent/package.json b/packages/design-agent/package.json
+index 8c74549..9c5f935 100644
+--- a/packages/design-agent/package.json
++++ b/packages/design-agent/package.json
+@@ -18,7 +18,7 @@
+     "konva": "^10.3.0",
+     "react-hot-toast": "^2.5.2",
+     "react-icons": "^5.5.0",
+-    "react-konva": "^19.0.0",
++    "react-konva": "19.2.7",
+     "react-markdown": "^10.1.0",
+     "react-syntax-highlighter": "^15.6.1",
+     "remark-gfm": "^4.0.1"

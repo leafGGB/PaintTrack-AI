@@ -1,0 +1,2 @@
+ALTER TABLE "generation_tasks" ADD COLUMN "cancel_requested_at" timestamp with time zone;--> statement-breakpoint
+ALTER TABLE "generation_tasks" ADD CONSTRAINT "generation_tasks_cancel_request_check" CHECK ("generation_tasks"."cancel_requested_at" IS NULL OR "generation_tasks"."status" IN ('queued', 'running', 'cancelled'));

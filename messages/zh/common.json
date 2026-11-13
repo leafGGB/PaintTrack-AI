@@ -24,7 +24,7 @@
     "agents-automation": "智能体与自动化"
   },
   "shell": {
-    "brand": "OpenGenerativeAI",
+    "brand": "PaintTrack",
     "studioFallback": "工作室",
     "expandSidebar": "展开侧边栏",
     "collapseSidebar": "收起侧边栏",
@@ -35,7 +35,16 @@
     "dropHere": "将媒体文件拖放到此处",
     "dropHereHint": "图片、视频或音频文件",
     "vadooPromo": "无限制 AI 图像与视频 → 自动发布为 YouTube Shorts 和 TikTok，赚取收益 ↗",
-    "dismiss": "关闭"
+    "dismiss": "关闭",
+    "tasks": "任务"
+  },
+  "account": {
+    "menuLabel": "账户菜单",
+    "openCenter": "账户中心",
+    "signedInAs": "当前登录账户",
+    "signOut": "安全登出",
+    "signingOut": "正在登出…",
+    "signOutError": "登出未完成，请重试。"
   },
   "settingsModal": {
     "title": "设置",
@@ -55,7 +64,7 @@
     "ariaLabel": "生成活动与通知"
   },
   "apiKeyModal": {
-    "title": "Open Generative AI",
+    "title": "PaintTrack",
     "subtitlePrefix": "输入您的",
     "subtitleSuffix": "API 密钥以开始创作",
     "close": "关闭",

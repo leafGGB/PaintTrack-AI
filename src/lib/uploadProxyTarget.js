@@ -88,19 +88,10 @@ function isAllowedS3Host(hostname) {
     return false;
 }
 
-export function getApiKeyFromRequest(request) {
-    if (!request || !request.headers) return null;
-    const authHeader = request.headers.get('Authorization');
-    if (authHeader && authHeader.startsWith('Bearer ')) {
-        const token = authHeader.substring(7).trim();
-        if (token) return token;
-    }
-    const headerKey = request.headers.get('x-api-key');
-    if (headerKey && headerKey.trim()) {
-        return headerKey.trim();
-    }
-    return null;
-}
+// 阶段 4.5.3：不再从入站请求读取供应商凭据。
+// 旧实现在这里解析 Authorization / 客户端头并转交给上传目标，
+// 等于让浏览器绕过服务端 Provider 直接驱动供应商。上传鉴权必须来自
+// 服务端 Provider 配置（lib/server/providers/providerConfig.js），不接受请求方自带密钥。
 
 const BLOCKED_EXTENSIONS = new Set([
     'html', 'htm', 'xhtml', 'svg', 'php', 'phtml', 'php3', 'php4', 'php5', 'phps',

@@ -17,4 +17,9 @@ export { default as McpCliStudio } from './components/McpCliStudio';
 export { default as AiInfluencerStudio } from './components/AiInfluencerStudio';
 export { default as LayersStudio } from './components/LayersStudio';
 export { default as MotionControlStudio } from './components/MotionControlStudio';
+
+// Shared UI primitives. `ConfirmDialog` replaces window.confirm(): app-styled,
+// accessible (alertdialog + focus trap + focus restore), and able to show an
+// in-flight/error state. Reuse this instead of writing another overlay.
+export { default as ConfirmDialog } from './components/ui/ConfirmDialog';
 export * from './muapi';

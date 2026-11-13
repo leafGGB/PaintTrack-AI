@@ -5,9 +5,11 @@ const { execFileSync } = require('child_process');
 
 const REPO_ROOT = path.resolve(__dirname, '..');
 const PACKAGE_JSON = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'package.json'), 'utf8'));
-const PRODUCT_NAME = PACKAGE_JSON.build?.productName || 'Open Generative AI';
-const PACKAGE_NAME = 'open-generative-ai';
-const COMMAND_NAME = 'open-generative-ai';
+const PRODUCT_NAME = PACKAGE_JSON.build?.productName || 'PaintTrack';
+const PACKAGE_NAME = 'painttrack';
+const COMMAND_NAME = 'painttrack';
+// Maintainer 以 package.json 为唯一来源，避免和 build.linux.maintainer 各写一份而漂移。
+const MAINTAINER = PACKAGE_JSON.build?.linux?.maintainer || 'PaintTrack Team';
 const INSTALL_DIR_NAME = PACKAGE_NAME;
 const LINUX_DEPENDS = [
     'libasound2t64 | libasound2',
@@ -174,9 +176,9 @@ Version: ${version}
 Section: graphics
 Priority: optional
 Architecture: ${debArch}
-Maintainer: Open Generative AI Team
+Maintainer: ${MAINTAINER}
 Depends: ${LINUX_DEPENDS}
-Description: Local-first generative AI studio for image, video, and design workflows
+Description: PaintTrack — local-first AI studio for image, video, and design workflows
 `,
         0o644
     );

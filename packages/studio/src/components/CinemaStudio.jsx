@@ -24,6 +24,8 @@ import {
 import en from "../messages/en/cinemaStudio.json";
 import zh from "../messages/zh/cinemaStudio.json";
 import { resolveCopy } from "../i18nUtils";
+import ConfirmDialog from "./ui/ConfirmDialog.jsx";
+import { getConfirmCopy } from "../confirmCopy.js";
 
 // ─── Constants (inlined from promptUtils) ───────────────────────────────────
 
@@ -539,6 +541,7 @@ export default function CinemaStudio({
   locale = "en",
 }) {
   const copy = resolveCopy(en, zh, locale);
+  const confirmCopy = getConfirmCopy(locale);
   const LEGACY_PERSIST_KEY = "hg_cinema_studio_persistent";
   const PERSIST_KEY = scopedPersistKey(LEGACY_PERSIST_KEY, apiKey);
   useEffect(() => {
@@ -571,6 +574,8 @@ export default function CinemaStudio({
 
   // ── Internal history state (used when historyItems prop is not provided) ──
   const [internalHistory, setInternalHistory] = useState([]);
+  // Deletion goes through the in-app ConfirmDialog instead of window.confirm().
+  const [pendingDeleteIdx, setPendingDeleteIdx] = useState(null);
 
   // ── Dropdown state ──
   const [openDropdown, setOpenDropdown] = useState(null); // 'ar' | 'res' | null
@@ -952,9 +957,7 @@ export default function CinemaStudio({
                     title={copy.actions.delete}
                     onClick={(e) => {
                       e.stopPropagation();
-                      if (confirm(copy.actions.deleteConfirm)) {
-                        setInternalHistory(prev => prev.filter((_, i) => i !== idx));
-                      }
+                      setPendingDeleteIdx(idx);
                     }}
                     className="p-2 bg-black/60 backdrop-blur-md rounded-full text-red-400 hover:bg-red-500 hover:text-white transition-all border border-white/10"
                   >
@@ -1004,9 +1007,7 @@ export default function CinemaStudio({
                       label: copy.actions.delete,
                       danger: true,
                       onSelect: () => {
-                        if (confirm(copy.actions.deleteConfirm)) {
-                          setInternalHistory((prev) => prev.filter((_, i) => i !== idx));
-                        }
+                        setPendingDeleteIdx(idx);
                       },
                     },
                   ]}
@@ -1300,6 +1301,19 @@ export default function CinemaStudio({
           />
         </div>
       )}  
+      {/* ── DELETE CONFIRM ── */}
+      <ConfirmDialog
+        open={pendingDeleteIdx !== null}
+        title={confirmCopy.deleteTitle}
+        description={confirmCopy.deleteDescription}
+        confirmLabel={confirmCopy.deleteAction}
+        cancelLabel={confirmCopy.deleteCancel}
+        onConfirm={() => {
+          setInternalHistory((prev) => prev.filter((_, i) => i !== pendingDeleteIdx));
+          setPendingDeleteIdx(null);
+        }}
+        onCancel={() => setPendingDeleteIdx(null)}
+      />
       {/* ── Camera Controls Overlay ── */}
       <CameraControlsOverlay
         isOpen={isOverlayOpen}

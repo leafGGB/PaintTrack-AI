@@ -6,6 +6,8 @@ import { scopedPersistKey, migrateLegacyPersistKey } from "../persistKey.js";
 import MobileGenerationActions, {
   GenerationCopyButtons,
 } from "./MobileGenerationActions.jsx";
+import ConfirmDialog from "./ui/ConfirmDialog.jsx";
+import { getConfirmCopy } from "../confirmCopy.js";
 import {
   PROMPT_CONTROL_LABEL_CLASS,
   PromptAspectRatioIcon,
@@ -327,6 +329,7 @@ export default function MarketingStudio({
   locale = "en",
 }) {
   const copy = resolveCopy(en, zh, locale);
+  const confirmCopy = getConfirmCopy(locale);
   const LEGACY_PERSIST_KEY = "hg_marketing_studio_persistent";
   const PERSIST_KEY = scopedPersistKey(LEGACY_PERSIST_KEY, apiKey);
   useEffect(() => {
@@ -347,6 +350,8 @@ export default function MarketingStudio({
   });
 
   const [localHistory, setLocalHistory] = useState([]);
+  // Deletion goes through the in-app ConfirmDialog instead of window.confirm().
+  const [pendingDelete, setPendingDelete] = useState(null); // { id }
   const history = historyItems ?? localHistory;
   const [isGenerating, setIsGenerating] = useState(false);
   const [dropdown, setDropdown] = useState(null); // 'format' | 'avatar' | 'ratio' | 'res' | 'duration'
@@ -505,11 +510,7 @@ export default function MarketingStudio({
                     title={copy.buttons.delete}
                     onClick={(e) => {
                       e.stopPropagation();
-                      if (confirm(copy.confirm.deleteItem)) {
-                        if (!historyItems) {
-                          setLocalHistory(prev => prev.filter(h => h.id !== entry.id));
-                        }
-                      }
+                      setPendingDelete({ id: entry.id });
                     }}
                     className="p-2 bg-black/60 backdrop-blur-md rounded-full text-red-400 hover:bg-red-500 hover:text-white transition-all border border-white/10"
                   >
@@ -536,13 +537,7 @@ export default function MarketingStudio({
                       label: copy.buttons.delete,
                       danger: true,
                       onSelect: () => {
-                        if (confirm(copy.confirm.deleteItem)) {
-                          if (!historyItems) {
-                            setLocalHistory((prev) =>
-                              prev.filter((item) => item.id !== entry.id),
-                            );
-                          }
-                        }
+                        setPendingDelete({ id: entry.id });
                       },
                     },
                   ]}
@@ -1006,6 +1001,24 @@ export default function MarketingStudio({
           </div>
         </div>
       )}
+
+      {/* ── DELETE CONFIRM ── */}
+      <ConfirmDialog
+        open={Boolean(pendingDelete)}
+        title={confirmCopy.deleteTitle}
+        description={confirmCopy.deleteDescription}
+        confirmLabel={confirmCopy.deleteAction}
+        cancelLabel={confirmCopy.deleteCancel}
+        onConfirm={() => {
+          if (pendingDelete && !historyItems) {
+            setLocalHistory((prev) =>
+              prev.filter((item) => item.id !== pendingDelete.id),
+            );
+          }
+          setPendingDelete(null);
+        }}
+        onCancel={() => setPendingDelete(null)}
+      />
     </div>
   );
 }

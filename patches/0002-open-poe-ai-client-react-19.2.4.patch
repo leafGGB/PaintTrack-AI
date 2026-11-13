@@ -1,0 +1,15 @@
+diff --git a/client/package.json b/client/package.json
+index 08a8c79..982dccb 100644
+--- a/client/package.json
++++ b/client/package.json
+@@ -11,8 +11,8 @@
+   "dependencies": {
+     "axios": "^1.13.2",
+     "next": "16.1.1",
+-    "react": "19.2.3",
+-    "react-dom": "19.2.3",
++    "react": "19.2.4",
++    "react-dom": "19.2.4",
+     "react-icons": "^5.5.0",
+     "react-hot-toast": "^2.4.1",
+     "reactflow": "^11.11.4",

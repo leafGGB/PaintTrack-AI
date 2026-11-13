@@ -1,0 +1,8 @@
+{
+  "deleteTitle": "Delete this item?",
+  "deleteDescription": "This cannot be undone.",
+  "deleteAction": "Delete",
+  "deleteCancel": "Cancel",
+  "deleteBusy": "Deleting…",
+  "failed": "Could not delete this item"
+}

@@ -27,9 +27,8 @@ muapi image generate "a cyberpunk city" \\
     tag: 'MCP',
     title: 'muapi-mcp-server',
     icon: FaPlug,
-    code: `claude mcp add --transport http muapi \\
-  https://api.muapi.ai/mcp \\
-  --header "Authorization: Bearer YOUR_KEY"`,
+    code: `# Direct provider access is disabled.
+# Configure the server-side provider instead (see docs/records/DB_SETUP.md).`,
     href: 'https://github.com/SamurAIGPT/muapi-mcp-server',
   },
   {

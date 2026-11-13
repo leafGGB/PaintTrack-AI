@@ -15,6 +15,8 @@ import {
   getWorkflowData,
 } from "../muapi.js";
 import dynamic from "next/dynamic";
+import ConfirmDialog from "./ui/ConfirmDialog.jsx";
+import { getConfirmCopy } from "../confirmCopy.js";
 
 const WorkflowUI = dynamic(() => import("./WorkflowUI"), {
   ssr: false,
@@ -162,6 +164,8 @@ export default function WorkflowStudio({
 
   const { id: urlWorkflowId, tab: urlTab } = getWorkflowInfo();
 
+  const confirmCopy = getConfirmCopy();
+
   const [workflows, setWorkflows] = useState([]);
   const [loading, setLoading] = useState(true);
   const [selectedWorkflow, setSelectedWorkflow] = useState(null);
@@ -170,6 +174,10 @@ export default function WorkflowStudio({
   const [renamingWorkflow, setRenamingWorkflow] = useState(null);
   const [newWorkflowName, setNewWorkflowName] = useState("");
   const [isDeletingId, setIsDeletingId] = useState(null);
+  // Deletion goes through the in-app ConfirmDialog instead of window.confirm();
+  // failures render inline instead of in a native alert().
+  const [pendingDeleteWorkflow, setPendingDeleteWorkflow] = useState(null); // { id, name }
+  const [deleteError, setDeleteError] = useState(null);
   const [inputSchema, setInputSchema] = useState(null);
   const [nodeSchemas, setNodeSchemas] = useState(null);
   const [workflowDef, setWorkflowDef] = useState(null);
@@ -293,15 +301,28 @@ export default function WorkflowStudio({
     [apiKey, router],
   );
 
-  const handleDeleteWorkflow = async (wfId) => {
-    if (!confirm("Are you sure you want to delete this workflow?")) return;
+  // Opens the confirmation dialog; the actual request runs in
+  // `confirmDeleteWorkflow` so the dialog can own the busy/error states.
+  const handleDeleteWorkflow = (wfId) => {
+    setDeleteError(null);
+    setPendingDeleteWorkflow({
+      id: wfId,
+      name: workflows.find((wf) => wf.id === wfId)?.name || null,
+    });
+  };
+
+  const confirmDeleteWorkflow = async () => {
+    if (!pendingDeleteWorkflow || isDeletingId) return;
+    const wfId = pendingDeleteWorkflow.id;
+    setDeleteError(null);
     setIsDeletingId(wfId);
     try {
       await deleteWorkflow(apiKey, wfId);
       setWorkflows((prev) => prev.filter((w) => w.id !== wfId));
+      setPendingDeleteWorkflow(null);
     } catch (err) {
       console.error("Delete failed:", err);
-      alert("Failed to delete workflow");
+      setDeleteError(err?.message || confirmCopy.failed);
     } finally {
       setIsDeletingId(null);
     }
@@ -1007,6 +1028,28 @@ export default function WorkflowStudio({
           </form>
         </div>
       )}
+
+      {/* ── DELETE CONFIRM ── */}
+      <ConfirmDialog
+        open={Boolean(pendingDeleteWorkflow)}
+        title={
+          pendingDeleteWorkflow?.name
+            ? `Delete "${pendingDeleteWorkflow.name}"?`
+            : confirmCopy.deleteTitle
+        }
+        description={confirmCopy.deleteDescription}
+        confirmLabel={confirmCopy.deleteAction}
+        cancelLabel={confirmCopy.deleteCancel}
+        busyLabel={confirmCopy.deleteBusy}
+        busy={Boolean(isDeletingId)}
+        error={deleteError}
+        onConfirm={confirmDeleteWorkflow}
+        onCancel={() => {
+          if (isDeletingId) return;
+          setPendingDeleteWorkflow(null);
+          setDeleteError(null);
+        }}
+      />
     </div>
   );
 }

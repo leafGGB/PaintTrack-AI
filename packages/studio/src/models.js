@@ -7,7 +7,7 @@ import {
   T2I_DIMENSION_RATIOS,
 } from './imageSizing.js';
 
-// Verified against https://api.muapi.ai/openapi.json on 2026-09-09.
+// Verified against the upstream public OpenAPI spec on 2026-09-09.
 // Seedance 2.5 shares common inputs across its Standard, Intl and Spicy routes.
 // Spicy T2V/I2V routes additionally support native resolution and audio
 // generation controls.
@@ -93,7 +93,7 @@ const MINIMAX_H3_OPEN_SEED_INPUT = Object.freeze({
   default: -1,
 });
 
-// Wan inputs verified against https://api.muapi.ai/openapi.json on 2026-09-09.
+// Wan inputs verified against the upstream public OpenAPI spec on 2026-09-09.
 const WAN_AUDIO_INPUT = Object.freeze({
   type: "string", field: "audio", title: "Guiding audio", name: "audio_url",
   description: "Audio to guide the video.",
@@ -111,7 +111,7 @@ const WAN_27_RESOLUTION_INPUT = Object.freeze({
   enum: Object.freeze(["720p", "1080p"]), default: "720p",
 });
 
-// Happy Horse inputs verified against https://api.muapi.ai/openapi.json on 2026-09-09.
+// Happy Horse inputs verified against the upstream public OpenAPI spec on 2026-09-09.
 const HAPPY_HORSE_SEED_INPUT = Object.freeze({
   type: "int", title: "Seed", name: "seed",
   description: "Optional seed for repeatable results.",
@@ -131,7 +131,7 @@ const HAPPY_HORSE_EDIT_INPUTS = Object.freeze({
   seed: HAPPY_HORSE_SEED_INPUT,
 });
 
-// Kling inputs verified against https://api.muapi.ai/openapi.json on 2026-09-09.
+// Kling inputs verified against the upstream public OpenAPI spec on 2026-09-09.
 // Output sizes are recorded only for documented routes;
 // resolution selects an endpoint and is not a native request parameter.
 const KLING_ASPECT_RATIO_INPUT = Object.freeze({

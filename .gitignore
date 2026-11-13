@@ -30,9 +30,22 @@ release/
 # Next.js
 .next/
 out/
+.next_local_*/
+
+# 本地开发私有资产目录（仅本机，不入库）
+.local-assets/
+
+# 本地启动器持久化状态（MFA 加密密钥，仅本机；丢了等于所有已注册 TOTP 失效）
+.local-state/
 
 # Misc
 *.pem
 .env
 .env.*
 !.env.example
+
+# WorkBuddy 本地工作区数据（验收报告、临时集成目录、日志，体量大且含本机路径）
+.workbuddy/
+
+# 依赖锁文件的历史备份
+package-lock.json.bak_*
