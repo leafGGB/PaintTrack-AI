@@ -32,4 +32,4 @@ LOCAL_DATABASE_ADMIN_URL="postgresql://postgres:<密码>@127.0.0.1:5433/postgres
 
 Node 22；PostgreSQL 监听 127.0.0.1:5433。
 
-细节见 `docs/ImplementationPlan/PAINTTRACK_ONBOARDING.md`。
+细节见 `docs/ImplementationPlan/PAINTTRACK_ONBOARDING.md`。新会话的开场提示词模板见 `docs/ImplementationPlan/NEW_SESSION_PROMPT.md`。
