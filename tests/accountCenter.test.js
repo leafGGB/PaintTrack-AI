@@ -28,6 +28,26 @@ test('session me returns only the account identity projection and never queries 
   assert.equal(calls, 1);
 });
 
+test('account center ledger request contract covers filters, cursors, replacement, append retry, and task projection', () => {
+  const account = read('components/AccountCenter.js');
+  for (const kind of ['', 'grant', 'reserve', 'settle', 'release']) {
+    const query = new URLSearchParams({ limit: '20' });
+    if (kind) query.set('kind', kind);
+    query.set('cursor', 'cursor-1');
+    assert.equal(query.get('limit'), '20');
+    assert.equal(query.get('kind'), kind || null);
+    assert.equal(query.get('cursor'), 'cursor-1');
+  }
+  assert.match(account, /if \(!append \|\| !current\) return result\.credits/);
+  assert.match(account, /events: \[\.\.\.\(current\.events \|\| \[\]\),/);
+  assert.match(account, /if \(append\) setCreditsMoreError\(true\)/);
+  assert.match(account, /onClick=\{\(\) => loadCredits\(\{ append: true, cursor: credits\.nextCursor \}\)\}/);
+  assert.match(account, /event\.task \?/);
+  assert.match(account, /event\.task\.taskType/);
+  assert.match(account, /event\.task\.status/);
+  assert.doesNotMatch(account, /<a[^>]+event\.task|<a[^>]+event\.taskId/);
+});
+
 test('account center routes expose identity and explicit non-billing states in both locales', () => {
   const account = read('components/AccountCenter.js');
   const page = read('app/account/page.js');
@@ -36,11 +56,32 @@ test('account center routes expose identity and explicit non-billing states in b
   assert.match(page, /<AccountCenter\s*\/>/);
   assert.match(zhPage, /<AccountCenter locale="zh"\s*\/>/);
   for (const field of ['user.email', 'user.id', 'user.role', 'user.emailVerified', 'user.createdAt']) assert.ok(account.includes(field));
-  assert.match(account, /Credit service is not enabled/);
+  assert.match(account, /Loading live credit data/);
+  assert.match(account, /额度与账单/);
+  assert.match(account, /fetch\(`\/api\/account\/credits\?\$\{query\}`/);
+  assert.match(account, /availableTenths/);
+  assert.match(account, /reservedTenths/);
+  assert.match(account, /totalTenths/);
+  assert.match(account, /limit: '20'/);
+  assert.match(account, /query\.set\('kind', kind\)/);
+  assert.match(account, /query\.set\('cursor', cursor\)/);
+  assert.match(account, /creditKind/);
+  assert.match(account, /option value="grant"/);
+  assert.match(account, /option value="reserve"/);
+  assert.match(account, /option value="settle"/);
+  assert.match(account, /option value="release"/);
+  assert.match(account, /freezeHint/);
+  assert.match(account, /nextCursor/);
+  assert.match(account, /creditsLoadingMore/);
+  assert.match(account, /creditsMoreError/);
+  assert.match(account, /AbortController/);
+  assert.match(account, /request\.sequence/);
+  assert.match(account, /event\.task \?/);
+  assert.doesNotMatch(account, /href=.*taskId|href=.*event\.task/);
   assert.match(account, /backToStudio: 'Back to studio'/);
   assert.match(account, /backToStudio: '返回工作室'/);
   assert.ok(account.includes("href={isZh ? '/zh/studio' : '/studio'}"));
-  assert.match(account, /额度服务尚未启用/);
+  assert.match(account, /正在读取真实额度/);
   assert.match(account, /fetch\('\/api\/auth\/logout'/);
   assert.match(account, /fetch\('\/api\/auth\/me'/);
   assert.match(account, /mfaRequest\('status'\)/);

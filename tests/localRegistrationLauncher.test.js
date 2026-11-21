@@ -1,8 +1,115 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('node:path');
-const { DEFAULT_LOCAL_DATABASE, assertNoNextEnvironmentFiles, createCleanupEnvironment, createLocalSecrets, createNextEnvironment, createWorkerEnvironment, localAdminUrl, localAssetStorageRoot, localDatabasePlan, localRoleUrl, localRolesFromOwner, validRequest } = require('../scripts/local-registration');
+const { DEFAULT_LOCAL_DATABASE, assertNoNextEnvironmentFiles, createCleanupEnvironment, createLocalSecrets, createNextEnvironment, createSettlementEnvironment, createWorkerEnvironment, localAdminUrl, localAssetStorageRoot, localDatabasePlan, localRoleUrl, localRolesFromOwner, validRequest } = require('../scripts/local-registration');
 const { spawnSync } = require('node:child_process');
+const { localExecutionOptions, controlledImageLaunch } = require('../scripts/local-registration');
+
+test('controlled image launcher requires explicit isolated mode and does not reuse the seeded database', () => {
+    const environment = { PAINTTRACK_CONTROLLED_IMAGE_PASSWORD: 'synthetic-test-password' };
+    const fixture = controlledImageLaunch(['--controlled-image'], environment);
+    assert.equal(fixture.fixtureEmail, 'controlled-image@example.test');
+    assert.equal(controlledImageLaunch([], environment), null);
+    assert.throws(() => controlledImageLaunch([], { ...environment, PAINTTRACK_LOCAL_CONTROLLED_IMAGE: '1' }));
+    assert.throws(() => controlledImageLaunch(['--controlled-image'], {}));
+    for (const option of ['--mock', '--worker', '--fresh', '--prune', '--authorization-fixtures']) {
+        assert.throws(() => controlledImageLaunch(['--controlled-image', option], environment), /MODE_CONFLICT/);
+    }
+    for (const flag of ['PAINTTRACK_LOCAL_DATABASE', 'PAINTTRACK_ASSET_STORAGE_ROOT', 'PAINTTRACK_LOCAL_MOCK_ROUTING',
+        'PAINTTRACK_WORKER_PROVIDER', 'PAINTTRACK_CHARGED_SUBMISSION', 'PAINTTRACK_LOCAL_SETTLEMENT']) {
+        assert.throws(() => controlledImageLaunch(['--controlled-image'], { ...environment, [flag]: 'true' }), /MODE_CONFLICT/);
+    }
+    const plan = localDatabasePlan({ controlledImage: true, randomSuffix: 'aabb00112233' });
+    assert.equal(plan.database, 'pt_local_auth_ci_aabb00112233');
+    assert.equal(plan.runtimeRole, 'pt_local_runtime_ci_aabb00112233');
+    assert.equal(plan.workerRole, 'pt_local_worker_ci_aabb00112233');
+    assert.equal(plan.reuse, false);
+    assert.throws(() => localDatabasePlan({ environment: { PAINTTRACK_LOCAL_DATABASE: plan.database } }), /DATABASE_NAME_INVALID/);
+    assert.equal(require('../package.json').scripts['dev:controlled-image'], 'node scripts/local-registration.js --controlled-image');
+});
+
+test('受控启动器生成的隔离角色可通过实际授权函数的角色名校验', async () => {
+    const plan = localDatabasePlan({ controlledImage: true, randomSuffix: 'aabb00112233' });
+    const permissions = require('../lib/server/db/runtimePermissions');
+    const statements = [];
+    const client = { async query(sql, params) { statements.push([sql, params]); return { rows: [{ allowed: true }] }; } };
+    await permissions.grantWebRuntimePermissions(client, plan.runtimeRole);
+    await permissions.grantWorkerRuntimePermissions(client, plan.workerRole);
+    await permissions.grantCleanupRuntimePermissions(client, plan.cleanupRole);
+    await permissions.grantAdminModelsProjectionPermission(client, plan.runtimeRole);
+    for (const role of [plan.runtimeRole, plan.workerRole, plan.cleanupRole]) {
+        assert.ok(statements.some(([sql]) => sql.includes(`TO "${role}"`)));
+    }
+    assert.deepEqual(statements.at(-1)[1], [plan.runtimeRole]);
+    const before = statements.length;
+    await assert.rejects(permissions.grantAdminModelsProjectionPermission(client, plan.workerRole));
+    await assert.rejects(permissions.grantWebRuntimePermissions(client, `${plan.runtimeRole}0`));
+    assert.equal(statements.length, before);
+});
+
+test('受控快照绑定单图与本人，合成适配器返回可解码 PNG', async () => {
+    const controlled = require('../lib/server/tasks/controlledImageDevelopment');
+    const { createModelRouteResolver } = require('../lib/server/tasks/modelRouteResolver');
+    const ownerId = '55555555-5555-4555-8555-555555555555';
+    const environment = { NODE_ENV: 'development', PAINTTRACK_LOCAL_INTERNAL_GUARD: '1',
+        PAINTTRACK_LOCAL_CONTROLLED_IMAGE: '1', PAINTTRACK_CONTROLLED_IMAGE_OWNER: ownerId };
+    const url = 'postgres://pt_local_worker_ci_aabb00112233:fixture@127.0.0.1:5433/pt_local_auth_ci_aabb00112233';
+    assert.equal(controlled.controlledImageOwner(environment, url, 'worker'), ownerId);
+    for (const target of [url.replace('127.0.0.1', 'remote.example'), url.replaceAll('ci_', '')]) {
+        assert.throws(() => controlled.controlledImageOwner(environment, target, 'worker'));
+    }
+    assert.throws(() => controlled.controlledImageOwner(environment, url, 'runtime'));
+    const input = { taskType: 'image.generate', payload: { logicalModelId: controlled.logicalModelId, outputCount: 1 } };
+    controlled.assertControlledImageSubmission({ user: { id: ownerId }, input }, ownerId);
+    assert.throws(() => controlled.assertControlledImageSubmission({ user: { id: 'other' }, input }, ownerId), { code: 'FORBIDDEN' });
+    assert.throws(() => controlled.assertControlledImageSubmission({ user: { id: ownerId }, input: { ...input, taskType: 'video.generate' } }, ownerId), { code: 'MODEL_UNAVAILABLE' });
+    const snapshot = await createModelRouteResolver({ catalog: controlled.catalog }).resolve(input);
+    assert.equal(snapshot.logicalModelPk, controlled.modelPk);
+    assert.match(snapshot.routeSnapshotHash, /^[0-9a-f]{64}$/);
+    const { result } = await controlled.createSyntheticImageAdapter().submit({ taskId: ownerId });
+    assert.equal(result.mimeType, 'image/png');
+    const bytes = result.bytes;
+    assert.equal(bytes.readUInt32BE(16), 128);
+    assert.equal(bytes.readUInt32BE(20), 96);
+    const { crc32, inflateSync } = require('node:zlib');
+    for (let start = 8; start < bytes.length;) {
+        const end = start + 8 + bytes.readUInt32BE(start);
+        assert.equal(crc32(bytes.subarray(start + 4, end)), bytes.readUInt32BE(end));
+        if (bytes.toString('ascii', start + 4, start + 8) === 'IDAT') {
+            assert.equal(inflateSync(bytes.subarray(start + 8, end)).length, 96 * (128 * 3 + 1));
+        }
+        start = end + 4;
+    }
+});
+
+test('explicit Mock launcher options default closed and preserve exact environment opt-in', () => {
+    assert.deepEqual(localExecutionOptions([], {}), { mockRouting: false, localWorker: false });
+    assert.deepEqual(localExecutionOptions(['--mock', '--worker'], {}), { mockRouting: true, localWorker: true });
+    assert.deepEqual(localExecutionOptions(['--mock'], {}), { mockRouting: true, localWorker: false });
+    assert.deepEqual(localExecutionOptions(['--worker'], {}), { mockRouting: false, localWorker: true });
+    assert.deepEqual(localExecutionOptions([], { PAINTTRACK_LOCAL_MOCK_ROUTING: '1', PAINTTRACK_LOCAL_WORKER: '1' }), { mockRouting: true, localWorker: true });
+    assert.deepEqual(localExecutionOptions([], { PAINTTRACK_LOCAL_MOCK_ROUTING: 'true', PAINTTRACK_LOCAL_WORKER: '1 ' }), { mockRouting: false, localWorker: false });
+});
+
+test('dev:mock explicitly enables both options and passes Mock capability to both child environments', () => {
+    assert.equal(require('../package.json').scripts['dev:mock'], 'node scripts/local-registration.js --mock --worker');
+    const source = require('node:fs').readFileSync(path.resolve(__dirname, '../scripts/local-registration.js'), 'utf8');
+    assert.match(source, /const \{ mockRouting, localWorker \} = localExecutionOptions\(process\.argv\.slice\(2\), process\.env\)/);
+    assert.match(source, /if \(mockRouting\) \{\s*await prepareLocalMockRouting\(owner, runtimeRole\)/);
+    assert.match(source, /const workerProcess = localWorker/);
+    assert.match(source, /createWorkerEnvironment\(workerUrl, process\.env, \{ mockRouting, assetStorageRoot \}\)/);
+    assert.match(source, /const nextEnv = createNextEnvironment\(\{[\s\S]*?\bmockRouting,/);
+    const options = localExecutionOptions(['--mock', '--worker'], {});
+    const next = createNextEnvironment({ runtimeUrl: 'postgres://synthetic', internalPort: 3001,
+        origin: 'http://127.0.0.1:3000', secret: 'a'.repeat(64), mfaEncryptionKey: 'b'.repeat(64),
+        suffix: 'test', heapMb: 3072, mockRouting: options.mockRouting }, {});
+    const worker = createWorkerEnvironment('postgres://synthetic-worker', {}, options);
+    for (const env of [next, worker]) {
+        assert.equal(env.PAINTTRACK_LOCAL_MOCK_ROUTING, '1');
+        assert.equal(env.PAINTTRACK_LOCAL_INTERNAL_GUARD, '1');
+        assert.equal(env.NODE_ENV, 'development');
+    }
+});
 
 test('local admin URL is explicit, loopback:5433/postgres only, and errors never echo input', () => {
     for (const value of [undefined, '', '   ']) assert.throws(() => localAdminUrl(value), { message: 'LOCAL_DATABASE_ADMIN_URL_REQUIRED' });
@@ -112,6 +219,20 @@ test('cleanup 子进程只拿到 cleanup 连接，不携带 Web/Worker 身份', 
     assert.equal(env.PAINTTRACK_WORKER_DATABASE_URL, undefined);
     assert.throws(() => createCleanupEnvironment(''), TypeError);
     assert.equal(createCleanupEnvironment('postgres://cleanup', {}, {}).PAINTTRACK_ASSET_STORAGE_ROOT, undefined);
+});
+
+test('settlement host receives only explicit ledger and target connections', () => {
+    const env = createSettlementEnvironment('postgres://ledger:secret@127.0.0.1:5433/isolated', 'postgres://web:secret@127.0.0.1:5433/isolated', {
+        PATH: 'system-path', DATABASE_URL: 'postgres://inherited', LEDGER_DATABASE_URL: 'postgres://inherited-ledger',
+        PAINTTRACK_WORKER_DATABASE_URL: 'postgres://worker:leaked', PAINTTRACK_SETTLEMENT_INTERVAL_MS: '5000',
+    });
+    assert.equal(env.LEDGER_DATABASE_URL, 'postgres://ledger:secret@127.0.0.1:5433/isolated');
+    assert.equal(env.DATABASE_URL, 'postgres://web:secret@127.0.0.1:5433/isolated');
+    assert.equal(env.PAINTTRACK_SETTLEMENT_INTERVAL_MS, '5000');
+    assert.equal(env.PAINTTRACK_WORKER_DATABASE_URL, undefined);
+    assert.equal(env.PATH, 'system-path');
+    assert.throws(() => createSettlementEnvironment('', 'postgres://web'), /ledgerUrl is required/);
+    assert.throws(() => createSettlementEnvironment('postgres://ledger', ''), /targetUrl is required/);
 });
 
 test('Next environment contains only system keys and explicit local runtime settings', () => {

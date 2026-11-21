@@ -1,4 +1,5 @@
-import { createAuthorizationHandler } from '../../../../lib/server/authorizationHttp';
+const { createAdminSummaryHandler } = require('../../../../lib/server/adminSummaryHttp');
+
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
-export const GET = createAuthorizationHandler('admin.summary');
+export const GET = createAdminSummaryHandler();

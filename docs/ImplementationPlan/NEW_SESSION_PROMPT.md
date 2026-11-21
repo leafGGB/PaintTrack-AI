@@ -13,8 +13,8 @@
 
 1. `AGENTS.md`（硬约束）
 2. `docs/ImplementationPlan/PAINTTRACK_ONBOARDING.md`（项目现状、文档地图、环境、常见坑）
-3. `docs/ImplementationPlan/PAINTTRACK_DEVELOPMENT_PROCESS.md` —— **只读 §10.4「当前状态与下一步」和文末「阶段状态速查」表**，不要从头读到尾
-4. `docs/records/HANDOFF_2026-11-13.md`（最近一次交接）
+3. `docs/ImplementationPlan/PAINTTRACK_DEVELOPMENT_PROCESS.md` —— **按 §10.0 执行控制协议读取 §10.4 最新当前执行卡**；阶段状态速查仅作摘要，不得据此另定下一步
+4. `docs/records/HANDOFF_2026-11-17.md`（当前交接；更早交接仅作历史追溯）
 5. 如果接下来的工作是阶段 6，加读 `docs/records/PHASE6_ACCOUNT_CENTER_PRODUCT_DESIGN.md`；如果涉及数据库，加读 `docs/records/DB_SETUP.md`
 
 ## 第二步：核验真实状态（不要只信文档）
@@ -62,11 +62,11 @@ npm test
 - **写 API 与计费 UI 保持关闭**。Provider 配置写 API、真实余额/扣费/充值入口，在对应门禁通过前不得开放。
 - **`drizzle/*.sql` 必须是 LF 行尾**。仓库已用 `.gitattributes` 钉死；若测试报迁移哈希不一致，是行尾问题，不要改测试断言或哈希常量。
 
-## 当前已知的下一步（如与文档冲突，以文档为准）
+## 当前任务定位
 
-阶段 6.2 计价与账本契约的**剩余参数收口**：管理员计价模板的落地细节、价格生效与报价有效期、注册赠送额度与有效期、反滥用阈值与申诉、上游长期未知的人工处置 SLA。
+本提示词不复制阶段状态、任务号或下一步，避免成为第二个权威来源。新会话完成前述工作树和环境核验后，只引用 `docs/ImplementationPlan/PAINTTRACK_DEVELOPMENT_PROCESS.md` §10.4 最新当前执行卡；授权和冲突处理遵循该文件 §10.0。任务列表、handoff、阶段设计稿、Onboarding、memory 中的旧“当前/下一步”均须与当前执行卡核对，不能单独作为开工授权。
 
-额度账本、数据库迁移（0024）、支付与收费代码**均未实现，也未获授权**。不要自行开始写账本或建迁移。
+如当前执行卡缺失、信息不全或与用户最近指令/代码实际状态冲突：先报告冲突与证据，标记待澄清/阻断并暂停，不猜测任务定义、不发起外部调用。
 
 ---
 
@@ -77,7 +77,7 @@ npm test
 ```
 工作目录 F:\111\QAQ\me\AI Agent\Hub\PaintTrack\PaintTrack。
 按顺序读 AGENTS.md、docs/ImplementationPlan/PAINTTRACK_ONBOARDING.md、
-总体实施计划的 §10.4 与阶段状态速查表、docs/records/HANDOFF_2026-11-13.md。
+总体实施计划的 §10.4 与阶段状态速查表、docs/records/HANDOFF_2026-11-17.md。
 然后用 6 行以内告诉我：项目是什么、现在在哪一步、下一步做什么、依据是哪份文档的哪一节。
 先不要改任何文件，等我确认。
 ```

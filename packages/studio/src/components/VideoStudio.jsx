@@ -2,9 +2,12 @@
 
 import { useState, useEffect, useRef, useCallback, useMemo, useId } from "react";
 import toast, { Toaster } from "react-hot-toast";
-import { generateVideo, generateI2V, processV2V, uploadFile } from "../muapi.js";
+import { uploadFile } from "../muapi.js";
+import { createVideoTask, getVideoTaskCatalog, waitForVideoTask, deleteAsset, assetIdFromResultUrl } from "../taskClient.js";
+import useStudioHistory from "../useStudioHistory.js";
+import { invalidateAssets } from '../assetInvalidations.js';
 import { formatErrorMessage } from "../utils/formatError.js";
-import { scopedPersistKey, migrateLegacyPersistKey } from "../persistKey.js";
+import { scopedPersistKey } from "../persistKey.js";
 import DrawModal from "./DrawModal.jsx";
 import ModelParameterControls from "./ModelParameterControls.jsx";
 import { VideoOptionControl, VideoSettingsControl } from "./VideoModelControls.jsx";
@@ -774,6 +777,7 @@ function ModelDropdown({ selectedModel, onSelect, onClose, copy = en }) {
 
 export default function VideoStudio({
   apiKey,
+  accountId = null,
   onGenerationStart,
   onGenerationEnd,
   onGenerationComplete,
@@ -787,10 +791,8 @@ export default function VideoStudio({
   const copy = useMemo(() => resolveCopy(en, zh, locale), [locale]);
   const confirmCopy = getConfirmCopy(locale);
   const LEGACY_PERSIST_KEY = "hg_video_studio_persistent";
-  const PERSIST_KEY = scopedPersistKey(LEGACY_PERSIST_KEY, apiKey);
-  useEffect(() => {
-    migrateLegacyPersistKey(LEGACY_PERSIST_KEY, PERSIST_KEY);
-  }, [PERSIST_KEY]);
+  const persistIdentity = accountId || apiKey || null;
+  const PERSIST_KEY = scopedPersistKey(LEGACY_PERSIST_KEY, persistIdentity);
 
   // ── generation state ──
   const [imageMode, setImageMode] = useState(false); // i2v
@@ -815,6 +817,7 @@ export default function VideoStudio({
     defaultModel.inputs?.quality?.default || "",
   );
   const [selectedEffect, setSelectedEffect] = useState("");
+  const [selectedFps, setSelectedFps] = useState(24);
   const [modelParameterValues, setModelParameterValues] = useState(() =>
     createModelParameterValues(defaultModel),
   );
@@ -849,6 +852,11 @@ export default function VideoStudio({
   const uploadedVideoUrl = uploadedVideoUrls[0] || null;
 
   // ── generation / canvas ──
+  const [videoTaskCatalog, setVideoTaskCatalog] = useState([]);
+  const [videoTaskModelId, setVideoTaskModelId] = useState(null);
+  const [videoTaskCatalogLoading, setVideoTaskCatalogLoading] = useState(true);
+  const [videoTaskCatalogError, setVideoTaskCatalogError] = useState(null);
+  const [videoCatalogRetry, setVideoCatalogRetry] = useState(0);
   const [generating, setGenerating] = useState(false);
   const [generateError, setGenerateError] = useState(null);
   const [fullscreenUrl, setFullscreenUrl] = useState(null);
@@ -881,6 +889,7 @@ export default function VideoStudio({
   const workflowControlId = useId();
   const workflowMenuId = `${workflowControlId}-menu`;
   const hasRestored = useRef(false);
+  const videoTaskControllerRef = useRef(null);
   const selectionRef = useRef(null);
   selectionRef.current = {
     selectedFamilyId,
@@ -911,19 +920,65 @@ export default function VideoStudio({
   };
 
   // ── derived data ──
-  const history = historyItems ?? localHistory;
+  const studioHistory = useStudioHistory(accountId, "video");
+  const useAccountHistory = Boolean(accountId);
+  const history = useAccountHistory ? studioHistory.items : historyItems ?? localHistory;
+  const isHistoryLoading = useAccountHistory && studioHistory.loading;
+  const selectedTaskModel = videoTaskCatalog.find((model) => model.logicalModelId === videoTaskModelId) || null;
+  const isLocalMockVideoModel = selectedTaskModel?.logicalModelId.startsWith("local-mock-") === true;
+  const taskDurationSeconds = isLocalMockVideoModel ? 1 : selectedDuration;
+  const taskFps = isLocalMockVideoModel ? 1 : selectedFps;
+  const taskDurationMs = Math.round(Number(taskDurationSeconds) * 1000);
+  const validTaskParameters = Number.isSafeInteger(taskDurationMs) && taskDurationMs > 0
+    && taskDurationMs / 1000 === Number(taskDurationSeconds)
+    && Number.isSafeInteger(Number(taskFps)) && Number(taskFps) > 0;
+  const taskParametersDisabled = generating || videoTaskCatalogLoading || Boolean(videoTaskCatalogError) || !selectedTaskModel;
+  const taskParameterHelpId = `${workflowControlId}-task-parameter-help`;
+  const unsupportedVideoFormatReason = locale === "zh"
+    ? "当前视频任务 API 未接入宽高比和分辨率参数，暂不可调整，也不会提交这些参数。"
+    : "Aspect ratio and resolution are not connected to the video task API; these settings are disabled and are not submitted.";
+
+  useEffect(() => {
+    const controller = new AbortController();
+    setVideoTaskCatalogLoading(true);
+    setVideoTaskCatalogError(null);
+    setVideoTaskCatalog([]);
+    setVideoTaskModelId(null);
+    getVideoTaskCatalog({ signal: controller.signal })
+      .then((models) => {
+        if (controller.signal.aborted) return;
+        setVideoTaskCatalog(models);
+        setVideoTaskModelId((current) => current && models.some((model) => model.logicalModelId === current)
+          ? current : models[0]?.logicalModelId || null);
+      })
+      .catch((error) => {
+        if (!controller.signal.aborted && error.name !== "AbortError") {
+          setVideoTaskCatalog([]);
+          setVideoTaskCatalogError(error.code || "VIDEO_CATALOG_UNAVAILABLE");
+        }
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setVideoTaskCatalogLoading(false);
+      });
+    return () => controller.abort();
+  }, [apiKey, accountId, videoCatalogRetry]);
 
   // See ImageStudio's handleDeleteEntry: when historyItems is server-backed
   // (White Label / backfilled sessions), localHistory isn't what's rendered,
   // so removal has to go through the parent to delete server-side and
   // update the same state `history` reads from.
   const handleDeleteEntry = useCallback(async (entry, idx) => {
-    if (historyItems && onDeleteHistoryItem) {
+    const assetId = entry?.assetId || assetIdFromResultUrl(entry?.url);
+    if (assetId) await deleteAsset(assetId);
+    if (useAccountHistory) {
+      await studioHistory.refresh();
+      invalidateAssets(accountId);
+    } else if (historyItems && onDeleteHistoryItem) {
       await onDeleteHistoryItem(entry);
     } else {
       setLocalHistory((prev) => prev.filter((_, i) => i !== idx));
     }
-  }, [historyItems, onDeleteHistoryItem]);
+  }, [useAccountHistory, studioHistory.refresh, historyItems, onDeleteHistoryItem]);
 
   // Deletion confirmation goes through the in-app ConfirmDialog instead of
   // window.confirm(): the native dialog carries browser chrome, localizes its
@@ -1087,7 +1142,7 @@ export default function VideoStudio({
   const selectedWorkflow = selectedWorkflowId
     ? workflowFamily?.workflowById.get(selectedWorkflowId) || null
     : null;
-  const groupedConfiguration = getGroupedVideoConfiguration(selectedModel);
+  const groupedConfiguration = null;
   const groupCopyKey = getGroupedVideoCopyKey(selectedFamilyId);
   const providerCopy = copy[groupCopyKey] || copy.seedance;
   const groupCopy = useMemo(() => ({
@@ -1096,16 +1151,12 @@ export default function VideoStudio({
     fields: { ...copy.modelControls.fields, ...providerCopy.fields },
     adjustments: { ...copy.modelControls.adjustments, ...providerCopy.adjustments },
   }), [copy, providerCopy]);
-  const workflowControlState = groupedConfiguration && workflowFamily
-    ? { kind: "menu", workflow: null }
-    : getVideoWorkflowControlState(
-    workflowFamily,
-    selectedModel,
-  );
+  // 未接入公共任务 API 的旧工作流不参与当前任务界面。
+  const workflowControlState = { kind: "hidden" };
   const workflowMediaDraftKey = selectedWorkflowId
     ? getVideoWorkflowDraftKey(selectedFamilyId, selectedWorkflowId)
     : null;
-  const selectedVariant = videoModelCatalog.variantById.get(selectedModel);
+  const selectedVariant = null;
   const activeWorkflowMediaDraft = useMemo(
     () => workflowMediaDraftKey
       ? projectVideoWorkflowMedia(
@@ -1122,17 +1173,14 @@ export default function VideoStudio({
     ],
   );
   const selectedPickerEntry = videoModelPickerEntryByVariantId.get(selectedModel);
-  const selectedTool = getSeedanceToolConfiguration(selectedModel);
-  const selectedVeoTool = getVeoToolConfiguration(selectedModel);
+  const selectedTool = null;
+  const selectedVeoTool = null;
   const veoContinuation = selectedVeoTool ? getContinuationConfig(selectedModel) : null;
   const veoSources = useMemo(() => selectedVeoTool
     ? getCompatibleContinuationSources(selectedModel, history) : [],
   [selectedModel, selectedVeoTool, history]);
   const selectedVeoSource = veoSources.find((entry) => entry.requestId === selectedVeoSourceId) || veoSources[0];
-  const selectedPickerLabel = selectedTool
-    ? seedanceToolLabel(selectedTool, copy, true)
-    : selectedVeoTool ? copy.veo.toolNames[selectedVeoTool.key]
-    : selectedPickerEntry?.name || selectedFamily.name;
+  const selectedPickerLabel = selectedTaskModel?.displayName || copy.dropdowns.model;
   const getSelectionPlan = useCallback((options = {}) => planGroupedVideoSelection({
     familyId: selectedFamilyId,
     workflowId: selectedWorkflowId,
@@ -1343,111 +1391,17 @@ export default function VideoStudio({
       const stored = localStorage.getItem(PERSIST_KEY);
       if (stored) {
         const data = JSON.parse(stored);
-        let restoredMode = data.v2vMode ? "v2v" : data.imageMode ? "i2v" : "t2v";
-        let restoredModelId = data.selectedModel || defaultModel.id;
-        let restoredWorkflowId = null;
-        let restoredModel = defaultModel;
-        let restoredFamilyId = defaultFamily.id;
-        let restoredResolution = data.selectedResolution;
-        if (data.selectedModel) {
-          const restored = resolvePersistedVideoWorkflowSelection(
-            migrateSeedanceResolutionSelection(data.selectedModel, data.selectedResolution),
-            data.selectedWorkflowId || null,
-            { hasEndFrame: Boolean(data.uploadedEndImageUrl || data.uploadedImageUrls?.[1]) },
-          );
-          if (restored.family && restored.variant) {
-            restoredModelId = restored.variant.model.id;
-            restoredMode = restored.variant.mode;
-            restoredWorkflowId = restored.workflowId;
-            restoredModel = restored.variant.model;
-            restoredFamilyId = restored.family.id;
-            const resolutionField = getGroupedVideoResolutionOptions(
-              restoredFamilyId, restoredWorkflowId, restoredModelId, restoredResolution,
-            );
-            // Restore the exact endpoint while respecting the workflow's allowed resolutions.
-            restoredResolution = resolutionField.options.find((option) =>
-              option.modelId === restoredModelId && option.value === resolutionField.value,
-            )?.resolution ?? restoredResolution;
-            setSelectedModel(restoredModelId);
-            setSelectedFamilyId(restored.family.id);
-            setSelectedWorkflowId(restored.workflowId);
-            setModelParameterValues(
-              mergeModelParameterValues(
-                restoredModel,
-                data.modelParameterValues || {},
-              ),
-            );
-          }
-        }
-        setImageMode(restoredMode === "i2v");
-        setV2vMode(restoredMode === "v2v");
-        if (data.selectedAr) setSelectedAr(data.selectedAr);
+        // 公共任务服务只支持文生视频，不能恢复旧供应商工作流及其媒体门禁。
         if (data.selectedDuration) setSelectedDuration(data.selectedDuration);
-        if (restoredResolution) setSelectedResolution(restoredResolution);
-        if (data.selectedQuality) setSelectedQuality(data.selectedQuality);
-        if (data.selectedEffect) setSelectedEffect(data.selectedEffect);
-        if (data.selectedVeoSourceId) setSelectedVeoSourceId(data.selectedVeoSourceId);
-        if (data.uploadedImageUrls) {
-          setUploadedImageUrls(data.uploadedImageUrls);
-        } else if (data.uploadedImageUrl) {
-          setUploadedImageUrls([data.uploadedImageUrl]);
-        }
-        if (data.uploadedEndImageUrl) setUploadedEndImageUrl(data.uploadedEndImageUrl);
-        if (data.uploadedVideoUrls) {
-          setUploadedVideoUrls(data.uploadedVideoUrls);
-        } else if (data.uploadedVideoUrl) {
-          setUploadedVideoUrls([data.uploadedVideoUrl]);
-        }
-        if (data.uploadedAudioUrls) setUploadedAudioUrls(data.uploadedAudioUrls);
-        const persistedDrafts =
-          data.workflowMediaDrafts && typeof data.workflowMediaDrafts === "object"
-            ? migrateVideoWorkflowMediaDrafts(data.workflowMediaDrafts)
-            : {};
-        if (restoredWorkflowId) {
-          const draftKey = getVideoWorkflowDraftKey(
-            restoredFamilyId,
-            restoredWorkflowId,
-          );
-          if (!data.selectedWorkflowId || !persistedDrafts[draftKey]) {
-            persistedDrafts[draftKey] = legacyVideoMediaToWorkflowDraft(
-              restoredModel,
-              restoredWorkflowId,
-              {
-                imageUrls: data.uploadedImageUrls ||
-                  (data.uploadedImageUrl ? [data.uploadedImageUrl] : []),
-                endImageUrl: data.uploadedEndImageUrl ||
-                  (restoredWorkflowId === "keyframes" ? data.uploadedImageUrls?.[1] : null),
-                videoUrls: data.uploadedVideoUrls ||
-                  (data.uploadedVideoUrl ? [data.uploadedVideoUrl] : []),
-                audioUrls: data.uploadedAudioUrls || [],
-              },
-            );
-          }
-        }
-        setWorkflowMediaDrafts(persistedDrafts);
         if (data.prompt) setPrompt(data.prompt);
-        if (data.localHistory) setLocalHistory(data.localHistory);
-
-        // Update control visibility based on restored model/mode
-        commonParameterValuesRef.current = {
-          ...data.modelParameterValues,
-          aspectRatio: data.selectedAr,
-          duration: data.selectedDuration,
-          resolution: restoredResolution,
-          quality: data.selectedQuality,
-        };
-        applyControlsForModel(
-          restoredModelId,
-          restoredMode === "i2v",
-          restoredMode === "v2v",
-        );
+        if (!accountId && data.localHistory) setLocalHistory(data.localHistory);
       }
     } catch (err) {
       console.warn("Failed to load VideoStudio persistence:", err);
     } finally {
       hasRestored.current = true;
     }
-  }, [applyControlsForModel, defaultModel.id]);
+  }, [applyControlsForModel, defaultModel.id, PERSIST_KEY, accountId]);
 
   // ── Persistence: Save ────────────────────────────────────────────────────
   useEffect(() => {
@@ -1472,7 +1426,7 @@ export default function VideoStudio({
           uploadedAudioUrls,
           workflowMediaDrafts,
           prompt,
-          localHistory,
+          ...(!accountId ? { localHistory } : {}),
         };
         localStorage.setItem(PERSIST_KEY, JSON.stringify(state));
       } catch (err) {
@@ -1500,6 +1454,8 @@ export default function VideoStudio({
     workflowMediaDrafts,
     prompt,
     localHistory,
+    accountId,
+    PERSIST_KEY,
   ]);
 
   // ── Derived UI values ────────────────────────────────────────────────────
@@ -1859,6 +1815,10 @@ export default function VideoStudio({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  useEffect(() => () => {
+    videoTaskControllerRef.current?.abort();
+  }, []);
+
   // ── close dropdown on outside click ─────────────────────────────────────
   useEffect(() => {
     if (!openDropdown) return;
@@ -2108,9 +2068,14 @@ export default function VideoStudio({
 
   // ── add to local history ──────────────────────────────────────────────────
   const addToLocalHistory = useCallback((entry) => {
-    setLocalHistory((prev) => [entry, ...prev].slice(0, 30));
+    if (useAccountHistory) {
+      void studioHistory.refresh();
+      invalidateAssets(accountId);
+    } else if (!historyItems) {
+      setLocalHistory((prev) => [entry, ...prev].slice(0, 30));
+    }
     setActiveHistoryIdx(0);
-  }, []);
+  }, [useAccountHistory, studioHistory.refresh, historyItems]);
 
   // ── show result in canvas ─────────────────────────────────────────────────
   const showVideoInCanvas = useCallback((url, model) => {
@@ -2121,95 +2086,24 @@ export default function VideoStudio({
 
   // ── generate ──────────────────────────────────────────────────────────────
   const handleGenerate = useCallback(async () => {
+    if (generating) return;
     if (mediaUploading || workflowUploadSlotRef.current) {
       toast.error(copy.errors.waitForCurrentUpload);
       return;
     }
-    const currentModel = getCurrentModel();
-    const grouped = getGroupedVideoConfiguration(selectedModel);
-    const activeParameterValues = createModelParameterValues(currentModel, modelParameterValues);
-    const generationParameterValues = grouped && currentModel.inputs?.omni_reference_task_type
-      ? { ...activeParameterValues, omni_reference_task_type: "auto" }
-      : activeParameterValues;
-    const commonParams = grouped
-      ? buildVideoCommonPayload(currentModel, {
-          ...generationParameterValues,
-          aspectRatio: selectedAr, duration: selectedDuration,
-          resolution: selectedResolution, quality: selectedQuality,
-        })
-      : {};
-    const groupedHistorySettings = grouped ? {
-      ...currentModel.fixedParameters,
-      ...commonParams,
-      workflowId: selectedWorkflowId,
-      modelParameterValues: { ...generationParameterValues },
-    } : {};
-    const isExtendMode = currentModel?.requiresRequestId;
-    const capabilities = getModelMediaCapabilities(currentModel);
-    const requestSource = selectedVeoTool ? selectedVeoSource : generationSources[selectedFamily.id];
-    const trimmedPrompt = promptDisabled ? "" : prompt.trim();
-    const workflowMedia = selectedWorkflowId
-      ? activeWorkflowMediaDraft || {}
-      : {
-          imageUrls: uploadedImageUrls,
-          endImageUrl: uploadedEndImageUrl,
-          videoUrls: uploadedVideoUrls,
-          audioUrls: uploadedAudioUrls,
-        };
-
-    if (!selectedWorkflowId && uploadedVideoUrls.length > 0 && capabilities.video.maxItems === 0) {
-      alert(`${selectedFamily.name} does not support video references.`);
+    if (videoTaskCatalogLoading || videoTaskCatalogError || !selectedTaskModel) {
+      setGenerateError(videoTaskCatalogError || (videoTaskCatalogLoading ? "VIDEO_CATALOG_LOADING" : "VIDEO_MODEL_NOT_IN_CATALOG"));
       return;
     }
-    if (!selectedWorkflowId && uploadedImageUrls.length > 0 && capabilities.image.maxItems === 0) {
-      alert(`${selectedFamily.name} does not support image references.`);
-      return;
-    }
-    if (!selectedWorkflowId && uploadedAudioUrls.length > 0 && capabilities.audio.maxItems === 0) {
-      alert(`${selectedFamily.name} does not support audio references.`);
-      return;
-    }
-    if ((currentModel?.promptRequired || veoContinuation?.promptRequired) && !trimmedPrompt) {
-      alert(copy.errors.noPromptForModel);
+    const trimmedPrompt = prompt.trim();
+    if (!trimmedPrompt) {
+      setGenerateError(copy.errors.enterPromptToGenerate);
       return;
     }
 
-    if (selectedWorkflowId) {
-      const validation = validateVideoWorkflowMedia(
-        selectedWorkflowId,
-        workflowMedia,
-        currentModel,
-      );
-      if (!validation.valid) {
-        alert(validation.message);
-        return;
-      }
-    } else if (v2vMode) {
-      if (!uploadedVideoUrl) {
-        alert(copy.errors.uploadVideoFirst);
-        return;
-      }
-      if (currentModel?.imageField && !currentModel?.imageOptional && !uploadedImageUrl) {
-        alert(copy.errors.uploadReferenceImageForMotion);
-        return;
-      }
-    } else if (isExtendMode) {
-      if (!requestSource?.requestId || (selectedFamily.id === "seedance-2" && !isContinuationSourceModel(currentModel, requestSource.modelId))) {
-        alert(copy.errors.noContinuationSource.replace("{family}", selectedFamily.name));
-        return;
-      }
-    } else if (imageMode) {
-      const requiresImage =
-        currentModel?.imageField && !currentModel?.imageOptional;
-      if (requiresImage && uploadedImageUrls.length === 0) {
-        alert(copy.errors.uploadAtLeastOneReferenceImage);
-        return;
-      }
-    } else {
-      if (!trimmedPrompt) {
-        alert(copy.errors.enterPromptToGenerate);
-        return;
-      }
+    if (!validTaskParameters) {
+      setGenerateError(locale === "zh" ? "请输入有效的视频时长和整数帧率。" : "Enter a valid duration and a positive integer frame rate.");
+      return;
     }
 
     onGenerationStart?.();
@@ -2217,147 +2111,43 @@ export default function VideoStudio({
     setGenerateError(null);
 
     try {
-      let res;
-      const referenceParams = selectedWorkflowId
-        ? buildVideoWorkflowMediaParams(
-            currentModel,
-            selectedWorkflowId,
-            workflowMedia,
-          )
-        : buildReferenceParams(currentModel, workflowMedia);
-
-      if (v2vMode) {
-        // V2V: dedicated processV2V handles single-input tools (e.g. watermark
-        // remover) and motion-control models (which take video + image + prompt)
-        const v2vParams = {
-          model: selectedModel,
-          ...buildSupplementalInputPayload(currentModel, generationParameterValues),
-          ...commonParams,
-          ...referenceParams,
-        };
-        if (currentModel?.hasPrompt && trimmedPrompt) {
-          v2vParams.prompt = trimmedPrompt;
-        }
-        res = await processV2V(apiKey, v2vParams);
-        if (!res?.url) throw new Error(copy.errors.noVideoUrlReturned);
-
-        const genId = res.request_id || res.id || Date.now().toString();
-        const entry = {
-          id: genId,
-          url: res.url,
-          prompt: currentModel?.hasPrompt ? trimmedPrompt : "",
-          model: selectedModel,
-          ...groupedHistorySettings,
-          timestamp: new Date().toISOString(),
-        };
-        addToLocalHistory(entry);
-        showVideoInCanvas(res.url, selectedModel);
-        if (onGenerationComplete)
-          onGenerationComplete({
-            url: res.url,
-            model: selectedModel,
-            prompt: currentModel?.hasPrompt ? trimmedPrompt : "",
-            type: "video",
-          });
-      } else if (imageMode) {
-        const i2vParams = {
-          model: selectedModel,
-          ...buildSupplementalInputPayload(currentModel, generationParameterValues),
-          ...commonParams,
-          ...referenceParams,
-        };
-        if (trimmedPrompt) i2vParams.prompt = trimmedPrompt;
-        const aspectRatios = getAspectRatiosForI2VModel(selectedModel);
-        if (!grouped && aspectRatios.length > 0) i2vParams.aspect_ratio = selectedAr;
-        const durations = getDurationsForI2VModel(selectedModel);
-        if (!grouped && durations.length > 0) i2vParams.duration = selectedDuration;
-        const resolutions = getResolutionsForI2VModel(selectedModel);
-        if (!grouped && resolutions.length > 0) i2vParams.resolution = selectedResolution;
-        if (!grouped && selectedQuality) i2vParams.quality = selectedQuality;
-        if (showEffect && selectedEffect) i2vParams.name = selectedEffect;
-
-        res = await generateI2V(apiKey, i2vParams);
-        if (!res?.url) throw new Error(copy.errors.noVideoUrlReturned);
-
-        const genId = res.request_id || res.id || Date.now().toString();
-        setGenerationSources((sources) =>
-          recordGenerationSource(sources, selectedFamily.id, genId, selectedModel),
-        );
-        const entry = {
-          id: genId,
-          url: res.url,
+        videoTaskControllerRef.current?.abort();
+        const taskController = new AbortController();
+        videoTaskControllerRef.current = taskController;
+        const task = await createVideoTask({
+          logicalModelId: selectedTaskModel.logicalModelId,
           prompt: trimmedPrompt,
-          model: selectedModel,
-          ...(!grouped ? {
-            ...(aspectRatios.length > 0 ? { aspect_ratio: selectedAr } : {}),
-            duration: selectedDuration,
-          } : {}),
-          ...groupedHistorySettings,
-          timestamp: new Date().toISOString(),
-        };
-        addToLocalHistory(entry);
-        showVideoInCanvas(res.url, selectedModel);
-        if (onGenerationComplete)
-          onGenerationComplete({
-            url: res.url,
-            model: selectedModel,
-            prompt: trimmedPrompt,
-            type: "video",
-          });
-      } else {
-        // T2V (including extend mode)
-        const params = {
-          model: selectedModel,
-          ...buildSupplementalInputPayload(currentModel, generationParameterValues),
-          ...commonParams,
-          ...referenceParams,
-        };
-        if (trimmedPrompt) params.prompt = trimmedPrompt;
-
-        if (isExtendMode) {
-          params.request_id = requestSource.requestId;
-        } else if (!grouped) {
-          params.aspect_ratio = selectedAr;
-        }
-
-        const durations = getDurationsForModel(selectedModel);
-        if (!grouped && durations.length > 0) params.duration = selectedDuration;
-        const resolutions = getResolutionsForVideoModel(selectedModel);
-        if (!grouped && resolutions.length > 0) params.resolution = selectedResolution;
-        if (!grouped && !selectedVeoTool && selectedQuality) params.quality = selectedQuality;
-
-        res = await generateVideo(apiKey, params);
-        if (!res?.url) throw new Error(copy.errors.noVideoUrlReturned);
-
-        const genId = res.request_id || res.id || Date.now().toString();
-        setGenerationSources((sources) =>
-          recordGenerationSource(sources, selectedFamily.id, genId, selectedModel),
-        );
+          durationMs: taskDurationMs,
+          fps: Number(taskFps),
+          signal: taskController.signal,
+        });
+        const completedTask = await waitForVideoTask(task.id, { signal: taskController.signal });
+        if (taskController.signal.aborted) return;
+        const resultUrl = completedTask.result.resultUrl;
         const entry = {
-          id: genId,
-          url: res.url,
+          id: completedTask.id,
+          assetId: completedTask.result.assetId || assetIdFromResultUrl(resultUrl),
+          url: resultUrl,
           prompt: trimmedPrompt,
-          model: selectedModel,
-          ...(!grouped && !selectedVeoTool ? {
-            aspect_ratio: selectedAr,
-            duration: selectedDuration,
-          } : {}),
-          ...groupedHistorySettings,
+          model: selectedTaskModel.logicalModelId,
+          duration: taskDurationMs / 1000,
+          fps: Number(taskFps),
           timestamp: new Date().toISOString(),
         };
         addToLocalHistory(entry);
-        showVideoInCanvas(res.url, selectedModel);
-        if (onGenerationComplete)
-          onGenerationComplete({
-            url: res.url,
-            model: selectedModel,
-            prompt: trimmedPrompt,
-            type: "video",
-          });
-      }
+        showVideoInCanvas(resultUrl, selectedTaskModel.logicalModelId);
+        onGenerationComplete?.({
+          url: resultUrl,
+          model: selectedTaskModel.logicalModelId,
+          prompt: trimmedPrompt,
+          type: "video",
+          task: completedTask,
+        });
     } catch (e) {
+      if (e?.name === "AbortError" || videoTaskControllerRef.current?.signal.aborted) return;
       console.error("[VideoStudio]", e);
       const errMsg = formatErrorMessage(e, copy.errors.videoGenerationFailed);
+      setGenerateError(errMsg);
       if (onGenerationError) onGenerationError(errMsg);
       else toast.error(errMsg);
     } finally {
@@ -2365,33 +2155,17 @@ export default function VideoStudio({
       onGenerationEnd?.();
     }
   }, [
-    apiKey,
     copy,
+    generating,
+    selectedTaskModel,
+    videoTaskCatalogLoading,
+    videoTaskCatalogError,
+    taskDurationMs,
+    taskFps,
+    validTaskParameters,
+    locale,
     prompt,
-    promptDisabled,
-    v2vMode,
-    imageMode,
-    selectedWorkflowId,
-    selectedModel,
-    selectedFamily,
-    selectedAr,
-    selectedDuration,
-    selectedResolution,
-    selectedQuality,
-    selectedEffect,
-    modelParameterValues,
-    showEffect,
-    uploadedImageUrls,
-    uploadedEndImageUrl,
-    uploadedVideoUrls,
-    uploadedAudioUrls,
-    activeWorkflowMediaDraft,
-    generationSources,
-    selectedVeoTool,
-    selectedVeoSource,
-    veoContinuation,
     mediaUploading,
-    getCurrentModel,
     addToLocalHistory,
     showVideoInCanvas,
     onGenerationComplete,
@@ -2452,24 +2226,15 @@ export default function VideoStudio({
     ? workflowMediaConfig.imageLimit > 0
     : workflowFamily
       ? currentModelCapabilities.image.maxItems > 0
-    : currentModelCapabilities.image.maxItems > 0 ||
-      (!v2vMode && selectedFamily.supports.i2v);
-  const imageTargetVariant = workflowFamily
-    ? selectedVariant
-    : currentModelCapabilities.image.maxItems > 0
-      ? selectedVariant
-      : getFamilyVariant(videoModelCatalog, selectedFamily, "i2v", selectedModel);
+    : currentModelCapabilities.image.maxItems > 0;
+  const imageTargetVariant = selectedVariant;
   const imageUploadCapability = getModelMediaCapabilities(imageTargetVariant?.model).image;
   const imageUploadLimit = workflowMediaConfig
     ? workflowMediaConfig.imageLimit
     : imageUploadCapability.separateLastItem
       ? 1
       : imageUploadCapability.maxItems;
-  const videoTargetVariant = workflowFamily
-    ? selectedVariant
-    : currentModelCapabilities.video.maxItems > 0
-      ? selectedVariant
-      : getFamilyVariant(videoModelCatalog, selectedFamily, "v2v", selectedModel);
+  const videoTargetVariant = selectedVariant;
   const videoUploadLimit = workflowMediaConfig
     ? workflowMediaConfig.videoLimit
     : getModelMediaCapabilities(videoTargetVariant?.model).video.maxItems;
@@ -2531,6 +2296,21 @@ export default function VideoStudio({
     >
       {/* ── CENTRAL GALLERY AREA ── */}
       <div className="flex-1 w-full max-w-7xl mx-auto overflow-y-auto custom-scrollbar pb-40 lg:pb-32 px-2">
+        {useAccountHistory && studioHistory.error && (
+          <div role="alert" className="mt-4 text-center text-sm text-red-300">
+            {locale === "zh" ? "账号历史加载失败，不会显示本地历史。" : "Account history could not be loaded. Local history is not used."}
+            <button type="button" className="ml-2 underline" disabled={isHistoryLoading} onClick={() => void studioHistory.retry()}>
+              {locale === "zh" ? "重试" : "Retry"}
+            </button>
+          </div>
+        )}
+        {isHistoryLoading && <div role="status" className="py-4 text-center text-sm text-white/60">{locale === "zh" ? "正在加载历史…" : "Loading history…"}</div>}
+        {generateError && (
+          <div role="alert" className="mt-4 text-center text-sm text-red-300">
+            {generateError}
+            <button type="button" className="ml-2 underline" disabled={generating || mediaUploading || videoTaskCatalogLoading || !selectedTaskModel} onClick={handleGenerate}>{locale === "zh" ? "重试生成" : "Retry generation"}</button>
+          </div>
+        )}
         {history.length > 0 ? (
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 w-full pt-4 animate-fade-in-up">
             {history.map((entry, idx) => {
@@ -2657,7 +2437,7 @@ export default function VideoStudio({
               );
             })}
           </div>
-        ) : (
+        ) : !isHistoryLoading && !(useAccountHistory && studioHistory.error) ? (
           <div className="flex flex-col items-center justify-center h-full animate-fade-in-up transition-all duration-700 min-h-[50vh]">
             {/* Overlapping floating cards */}
             <div className="flex items-center justify-center gap-1.5 md:gap-3 mb-10 select-none scale-90 sm:scale-100">
@@ -2694,7 +2474,7 @@ export default function VideoStudio({
             <h1 className="text-2xl sm:text-4xl md:text-5xl font-extrabold tracking-tight mb-4 text-center px-4 flex flex-col items-center">
               {!selectedTool && !selectedVeoTool && <span className="text-white font-black uppercase text-xl sm:text-3xl tracking-wide mb-1 opacity-90">{copy.empty.heading}</span>}
               <span className="text-[#22d3ee] font-black uppercase text-2xl sm:text-4xl sm:mt-1 tracking-tight">
-                {selectedTool || selectedVeoTool || selectedPickerEntry?.groupedVideo ? selectedPickerLabel : selectedFamily.name}
+                {selectedPickerLabel}
               </span>
             </h1>
             {!selectedTool && !selectedVeoTool && (
@@ -2705,11 +2485,43 @@ export default function VideoStudio({
               </p>
             )}
           </div>
+        ) : null}
+        {useAccountHistory && studioHistory.nextCursor && !studioHistory.error && (
+          <button type="button" className="mx-auto my-4 block text-sm text-primary underline" disabled={isHistoryLoading} onClick={() => void studioHistory.loadMore()}>
+            {locale === "zh" ? "加载更多" : "Load more"}
+          </button>
         )}
       </div>
 
       {/* ── BOTTOM PROMPT BAR ── */}
       <PromptComposer>
+          <div
+            role={videoTaskCatalogError || (!videoTaskCatalogLoading && !selectedTaskModel) ? "alert" : "status"}
+            aria-live="polite"
+            className="flex flex-wrap items-center gap-2 text-xs text-amber-200"
+            data-video-catalog-status
+          >
+            <span>
+              {videoTaskCatalogLoading
+                ? locale === "zh" ? "正在加载视频模型目录…" : "Loading video model catalog…"
+                : videoTaskCatalogError
+                  ? locale === "zh" ? "视频模型目录加载失败，暂不能生成。" : "Video model catalog failed to load; generation is unavailable."
+                  : !selectedTaskModel
+                    ? locale === "zh" ? "视频模型目录为空，暂无文生视频模型。本地 Mock 测试需在启动器中显式设置 PAINTTRACK_LOCAL_MOCK_ROUTING=1 后重启；页面不会自动补充 Mock。" : "The video model catalog is empty. Local Mock testing requires restarting the launcher with PAINTTRACK_LOCAL_MOCK_ROUTING=1 explicitly enabled; no automatic Mock fallback is used."
+                    : locale === "zh" ? `已加载 ${videoTaskCatalog.length} 个文生视频模型。` : `${videoTaskCatalog.length} text-to-video models loaded.`}
+            </span>
+            {(videoTaskCatalogLoading || videoTaskCatalogError || !selectedTaskModel) && (
+              <code>{videoTaskCatalogError || (videoTaskCatalogLoading ? "VIDEO_CATALOG_LOADING" : "VIDEO_CATALOG_EMPTY")}</code>
+            )}
+            <button
+              type="button"
+              className="underline disabled:opacity-50"
+              disabled={videoTaskCatalogLoading || generating}
+              onClick={() => setVideoCatalogRetry((value) => value + 1)}
+            >
+              {locale === "zh" ? "刷新视频模型" : "Refresh video models"}
+            </button>
+          </div>
           <div className="flex flex-col gap-3">
             {/* Inline list of uploaded media files */}
             <div className="flex items-start gap-2.5 flex-wrap">
@@ -3011,15 +2823,97 @@ export default function VideoStudio({
                     solid={Boolean(groupedConfiguration)}
                   >
                     <PromptPopoverHeader>{copy.dropdowns.model}</PromptPopoverHeader>
-                    <ModelDropdown
-                      selectedModel={selectedModel}
-                      onSelect={handleModelSelect}
-                      onClose={() => setOpenDropdown(null)}
-                      copy={copy}
-                    />
+                    <select
+                      aria-label={copy.dropdowns.model}
+                      value={videoTaskModelId || ""}
+                      disabled={videoTaskCatalogLoading || videoTaskCatalog.length === 0}
+                      onChange={(event) => {
+                        setVideoTaskModelId(event.target.value);
+                        setOpenDropdown(null);
+                      }}
+                      className="w-full bg-[#17191c] px-2 py-2 text-xs text-white"
+                    >
+                      {videoTaskCatalog.length === 0 && <option value="">{locale === "zh" ? "暂无文生视频模型" : "No video models"}</option>}
+                      {videoTaskCatalog.map((model) => (
+                        <option key={model.logicalModelId} value={model.logicalModelId}>{model.displayName} ({model.logicalModelId})</option>
+                      ))}
+                    </select>
                   </PromptPopover>
                 )}
               </div>
+
+              {[
+                { key: "task-duration", label: locale === "zh" ? "时长" : "Duration", inputLabel: locale === "zh" ? "时长（秒）" : "Duration (seconds)", value: taskDurationSeconds, unit: "s", min: "0.001", step: "0.001", onChange: setSelectedDuration },
+                { key: "task-fps", label: locale === "zh" ? "帧率" : "Frame rate", inputLabel: locale === "zh" ? "帧率（fps）" : "Frame rate (fps)", value: taskFps, unit: "fps", min: "1", step: "1", onChange: setSelectedFps },
+              ].map((parameter) => (
+                <div key={parameter.key} className="relative">
+                  <button
+                    type="button"
+                    aria-label={parameter.label}
+                    aria-haspopup="dialog"
+                    aria-expanded={openDropdown === parameter.key}
+                    aria-controls={openDropdown === parameter.key ? `${workflowControlId}-${parameter.key}` : undefined}
+                    onClick={toggleDropdown(parameter.key)}
+                    className={promptControlClassName({ active: openDropdown === parameter.key })}
+                  >
+                    {parameter.key === "task-duration" && <PromptDurationIcon />}
+                    <span className={PROMPT_CONTROL_LABEL_CLASS}>
+                      {isLocalMockVideoModel ? "Mock " : ""}{parameter.value}{parameter.unit}
+                    </span>
+                    <PromptChevronIcon />
+                  </button>
+                  {openDropdown === parameter.key && (
+                    <PromptPopover
+                      id={`${workflowControlId}-${parameter.key}`}
+                      role="dialog"
+                      aria-label={parameter.label}
+                      className="w-[240px] max-w-[calc(100vw-32px)]"
+                      onClick={(event) => event.stopPropagation()}
+                    >
+                      <PromptPopoverHeader>{parameter.label}</PromptPopoverHeader>
+                      <label className="flex flex-col gap-2 text-xs text-white/70">
+                        <span>{parameter.inputLabel}</span>
+                        <input
+                          type="number"
+                          min={parameter.min}
+                          step={parameter.step}
+                          value={parameter.value}
+                          aria-describedby={`${taskParameterHelpId}-${parameter.key}`}
+                          disabled={taskParametersDisabled || isLocalMockVideoModel}
+                          onChange={(event) => parameter.onChange(event.target.value)}
+                          className="w-full rounded-lg border border-white/10 bg-[#17191c] px-2 py-2 text-white disabled:cursor-not-allowed disabled:opacity-60"
+                        />
+                      </label>
+                      <p id={`${taskParameterHelpId}-${parameter.key}`} className="mt-3 text-[11px] text-white/60">
+                        {isLocalMockVideoModel
+                          ? locale === "zh" ? "Mock 固定限制：1 秒、1 fps，不可调整；仅用于合成演示。" : "Mock is fixed at 1 second and 1 fps; not adjustable, synthetic demo only."
+                          : locale === "zh" ? "时长和帧率按输入提交；具体模型是否支持由服务端校验。" : "Duration and frame rate are submitted as entered; the server validates model support."}
+                      </p>
+                    </PromptPopover>
+                  )}
+                </div>
+              ))}
+
+              <button
+                type="button"
+                disabled
+                title={unsupportedVideoFormatReason}
+                aria-label={copy.dropdowns.aspectRatio}
+                className={`${promptControlClassName()} disabled:cursor-not-allowed disabled:opacity-40`}
+              >
+                <PromptAspectRatioIcon />
+                <span className={PROMPT_CONTROL_LABEL_CLASS}>{copy.dropdowns.aspectRatio}</span>
+              </button>
+              <button
+                type="button"
+                disabled
+                title={unsupportedVideoFormatReason}
+                aria-label={copy.dropdowns.resolution}
+                className={`${promptControlClassName()} disabled:cursor-not-allowed disabled:opacity-40`}
+              >
+                <PromptQualityIcon />
+                <span className={PROMPT_CONTROL_LABEL_CLASS}>{copy.dropdowns.resolution}</span>
+              </button>
 
               {workflowControlState.kind !== "hidden" && (
                 <div className="relative flex items-center gap-1">
@@ -3196,7 +3090,7 @@ export default function VideoStudio({
               )}
 
               {/* Aspect ratio btn */}
-              {showAr && (
+              {selectedVariant && showAr && (
                 <div className="relative">
                   <button
                     type="button"
@@ -3312,46 +3206,6 @@ export default function VideoStudio({
                   copy={groupCopy}
                 />
               )}
-              {!groupedConfiguration && showDuration && (
-                <div className="relative">
-                  <button
-                    type="button"
-                    onClick={toggleDropdown("duration")}
-                    className={promptControlClassName({
-                      active: openDropdown === "duration",
-                    })}
-                  >
-                    <PromptDurationIcon />
-                    <span className={PROMPT_CONTROL_LABEL_CLASS}>
-                      {selectedDuration}s
-                    </span>
-                  </button>
-                  {openDropdown === "duration" && (
-                    <PromptPopover
-                      onClick={(e) => e.stopPropagation()}
-                    >
-                      <PromptPopoverHeader>
-                        {copy.dropdowns.duration}
-                      </PromptPopoverHeader>
-                      <PromptMenuList>
-                        {getCurrentDurations(selectedModel).map((d) => (
-                          <PromptMenuItem
-                            key={d}
-                            selected={selectedDuration === d}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setSelectedDuration(d);
-                              setOpenDropdown(null);
-                            }}
-                          >
-                            {d}s
-                          </PromptMenuItem>
-                        ))}
-                      </PromptMenuList>
-                    </PromptPopover>
-                  )}
-                </div>
-              )}
 
               {/* Resolution btn */}
               <VideoOptionControl
@@ -3363,7 +3217,7 @@ export default function VideoStudio({
                 onSelect={handleGroupedResolutionChange}
                 copy={groupCopy}
               />
-              {!groupedConfiguration && showResolution && (
+              {selectedVariant && !groupedConfiguration && showResolution && (
                 <div className="relative">
                   <button
                     type="button"
@@ -3430,7 +3284,7 @@ export default function VideoStudio({
             {/* Generate button */}
             <PromptAction
               onClick={handleGenerate}
-              disabled={generating || mediaUploading || (selectedTool?.group === "continueGenerated" && !hasContinuationSource) || (selectedVeoTool && !selectedVeoSource)}
+              disabled={generating || mediaUploading || videoTaskCatalogLoading || Boolean(videoTaskCatalogError) || !selectedTaskModel || !validTaskParameters || !prompt.trim()}
             >
               {generating ? (
                 <>

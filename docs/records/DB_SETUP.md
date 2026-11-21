@@ -1,10 +1,15 @@
 # Local PostgreSQL setup
 
-The application does not run migrations during startup. Install PostgreSQL locally and create separate `painttrack_dev` and `painttrack_test` databases. Use a runtime login and a distinct migration login for each database; the runtime role must not own the schema or have DDL privileges. Never reuse production credentials.
+The Next.js runtime does not apply migrations. The local `npm run dev` launcher prepares roles and runs migrations before starting Next.js. By default it reuses `pt_local_auth_000000000000`. Use `npm run test:db:local` for a fresh random acceptance database. Never reuse production credentials or point tests at a database containing user data.
 
-Set `DATABASE_URL` to the development runtime role and `MIGRATION_DATABASE_URL` to the migration role on the same database target. For PostgreSQL integration tests, set `TEST_DATABASE_URL` and `TEST_MIGRATION_DATABASE_URL` to separate runtime and migration roles on a dedicated loopback database whose name contains `test` or `acceptance`. Never point tests at production or a database containing user data. `.env.example` contains local-only placeholders; replace them with credentials configured in your local PostgreSQL instance.
+- `DATABASE_URL` identifies the development runtime login. This role must not own the schema or have DDL privileges.
+- `MIGRATION_DATABASE_URL` identifies a distinct development migration login for the same database. It applies schema migrations.
+- `LOCAL_DATABASE_ADMIN_URL` identifies the local PostgreSQL administrative connection. The launcher uses it for local preparation, the direct migration runner uses it for ledger-owner preparation, and isolated acceptance uses it to create a random database and roles. Do not pass it to Next.js or Worker as a runtime credential.
+- `TEST_DATABASE_URL` and `TEST_MIGRATION_DATABASE_URL` identify distinct runtime and migration logins for `npm run test:db` on a dedicated loopback database whose name contains `test` or `acceptance`.
 
-Run `npm run db:migrate` after configuring both development URLs. The migration runner requires the dedicated `MIGRATION_DATABASE_URL`, uses Drizzle's `__drizzle_migrations` journal and an advisory lock, then closes its connection after success or failure. Review migration SQL before applying it. If a migration fails, inspect the PostgreSQL error and migration journal, restore the local database from a backup if needed, then correct the migration in a new version; do not edit an already-applied migration. For a disposable local database, recreate it only after confirming it contains no needed data, then rerun migrations from an empty database.
+Provide credentials through the appropriate process environment. `.env.example` is a reference for placeholders. Do not create a root `.env` for the local launcher.
+
+For a manually managed development database, run `npm run db:migrate` with the two development URLs and `LOCAL_DATABASE_ADMIN_URL`. Verify the target before applying migrations. The runner uses Drizzle's `__drizzle_migrations` journal and an advisory lock, then closes its connection after success or failure. Review migration SQL before applying it. If a migration fails, inspect the PostgreSQL error and migration journal, restore the local database from a backup if needed, then correct the migration in a new version; do not edit an already-applied migration. For a disposable local database, recreate it only after confirming it contains no needed data, then rerun migrations from an empty database.
 
 Run `npm run test:db` only after setting both test URLs. The integration test rejects missing `TEST_MIGRATION_DATABASE_URL` and refuses a test database matching the runtime or migration target; it does not silently substitute runtime credentials. Run `npm test` for database-independent tests. `GET /api/health/database` returns 200 only when `SELECT 1` succeeds; otherwise it returns 503 without exposing connection details.
 
@@ -15,6 +20,8 @@ Run `npm run test:db` only after setting both test URLs. The integration test re
 每次运行都会新建唯一空隔离库、迁移角色和最小权限运行角色；先验收迁移、权限、事务和连接池，再把本次随机 runtimeUrl 仅通过子进程环境传给真实 Node/pg Worker。子进程不继承管理员连接、PG*、NODE_OPTIONS 或其他应用配置。Worker 验收包含 3 个并发进程处理 12 个任务且无重复领取、SIGKILL 终止后按 PostgreSQL 时钟等待租约自然过期并重新领取、过期及重领后旧 token 的 heartbeat/complete/fail 均被 fencing 拒绝、有效心跳续租、空闲/协作停止，以及非协作停止非零退出。每轮并发领取从 pg_stat_activity 确认 3 个独立 PostgreSQL 后端均使用本次运行角色且已释放领取事务，并核对任务 worker_id 对应子进程 PID；最终断言全部 15 个验收任务成功。逐项检查数据库状态、停止后恢复和 pg_stat_activity 连接释放；正常完成后通过管理员连接确认本次隔离库无遗留连接/事务。Windows 协作停止通过 IPC 触发进程内 SIGTERM 处理器，强制终止使用 child.kill('SIGKILL')。不调用 Provider 或云服务，不使用 JSON/Map/连接池替身。已有 `workerProcess.test.js` 的文件替身测试仍只是离线证据。
 
 报告保存在 `.workbuddy/database-acceptance-*.json`，只记录安全的检查名称、结果和资源名称，不打印或保存随机角色密码。成功创建的数据库、角色和本次验收任务均保留；不要复用上次报告的库（随机凭据未保存），也不要为重跑修改已有业务库。资源删除须另行明确审查；当前入口不清理数据库资源。只有包含真实 Worker 各项检查、管理员初始化检查且最终为 passed 的新报告才补齐本轮完整证据；旧版 passed 报告不包含阶段3.5检查。
+
+当前后台只读专项见[总体计划 §10.4](../ImplementationPlan/PAINTTRACK_DEVELOPMENT_PROCESS.md#104-当前状态与下一步)。通用隔离报告只有实际包含本次 summary、users、users/:id 专项检查且结果通过时，才可用作这三个接口的验收证据。可选 `admin-mfa-postgres` 检查也不能单独覆盖这三个接口。浏览器结果另记。
 
 ## 阶段 3.6：认证记录保留与清理
 

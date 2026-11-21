@@ -31,6 +31,7 @@ if (!testDatabaseUrl) {
             const migrationSettings = {
                 migrationDatabaseUrl: env.testMigrationDatabaseUrl,
                 databaseUrl: testDatabaseUrl,
+                localDatabaseAdminUrl: process.env.LOCAL_DATABASE_ADMIN_URL,
             };
             await migrateDatabase(migrationSettings);
             await migrateDatabase(migrationSettings);

@@ -99,6 +99,27 @@ test('limit 与游标有严格上界，非法输入统一返回 INVALID_PAGINATI
     assert.equal(encodeCursor(row()).length > 0, true);
 });
 
+test('Studio 历史只投影同属当前账号的成功任务和未删除的匹配归档，并按游标翻页', async () => {
+    const assetId = '00000000-0000-4000-8000-0000000000c1';
+    const entry = row({
+        asset_id: assetId, result_url: `/api/assets/${assetId}/content`,
+        logical_model_id: 'local-mock-video', prompt: 'my video', cursor_time: '2026-11-09T02:00:00.000123Z',
+    });
+    const pool = scriptedPool([{ rows: [entry, row()] }, { rows: [] }]);
+    const service = createTaskQueryService({ pool });
+    const first = await service.listStudioHistory({ ownerId: OWNER, media: 'video', limit: '1' });
+    assert.deepEqual(first.items, [{ id: TASK_ID, assetId, resultUrl: entry.result_url, logicalModelId: 'local-mock-video', prompt: 'my video', createdAt: entry.created_at }]);
+    assert.equal(first.nextCursor, encodeCursor(entry, entry.cursor_time));
+    assert.deepEqual(await service.listStudioHistory({ ownerId: OWNER, media: 'video', limit: '1', cursor: first.nextCursor }), { items: [], nextCursor: null });
+    assert.deepEqual(pool.calls[0].values, [OWNER, 'video', null, null, 2]);
+    assert.deepEqual(pool.calls[1].values, [OWNER, 'video', entry.cursor_time, TASK_ID, 2]);
+    const sql = pool.calls[0].text;
+    for (const predicate of [/t.owner_id = \$1::uuid/, /a.owner_id = t.owner_id/, /a.id::text = t.result->>'assetId'/, /t.status = 'succeeded'/, /a.status = 'ready'/, /a.deleted_at IS NULL/, /a.media_type = \$2::text/, /t.task_type = CASE/, /ORDER BY t.created_at DESC, t.id DESC/]) assert.match(sql, predicate);
+    await assert.rejects(service.listStudioHistory({ ownerId: OWNER, media: 'audio' }), { code: 'INVALID_MEDIA_FILTER' });
+    await assert.rejects(service.listStudioHistory({ ownerId: OWNER, media: 'image', cursor: 'invalid' }), { code: 'INVALID_PAGINATION' });
+    assert.equal(pool.calls.length, 2);
+});
+
 test('详情按 owner 查询，非法或他人任务统一返回 null 而不是区分错误', async () => {
     const pool = scriptedPool([{ rowCount: 1, rows: [row()] }]);
     const service = createTaskQueryService({ pool });

@@ -1,7 +1,17 @@
 'use strict';
 
 const assert = require('node:assert/strict');
-const { randomUUID, createHash } = require('node:crypto');
+const { randomUUID, randomBytes, createHash } = require('node:crypto');
+const { mkdtemp } = require('node:fs/promises');
+const path = require('node:path');
+const { drizzle } = require('drizzle-orm/node-postgres');
+const { hashPassword } = require('../../lib/server/registration');
+const { createAuthorizationHandler } = require('../../lib/server/authorizationHttp');
+const { createTaskDetailHandler } = require('../../lib/server/tasks/taskHttp');
+const { createFileObjectStore } = require('../../lib/server/storage/fileObjectStore');
+const { createControlledImageHost, startWorker } = require('../../lib/server/worker');
+const { createSyntheticImageAdapter, syntheticPng } = require('../../lib/server/tasks/controlledImageDevelopment');
+const { withAssetsHttp } = require('./assets-session-http-postgres.cjs');
 const { createLocalMockCatalog, createLocalMockProviderSelector, models } = require('../../lib/server/tasks/localMockCatalog');
 const { createModelRouteResolver, stableStringify } = require('../../lib/server/tasks/modelRouteResolver');
 const { createTaskSubmissionService } = require('../../lib/server/tasks/taskService');
@@ -56,7 +66,115 @@ async function readIdentity(client) {
     return result.rows[0];
 }
 
-async function checkLocalMockRoute(workerPool, record, { webPool, owner, database, runtimeRole, workerRole, migrationRole, objectStore }) {
+async function checkControlledImage({ owner, webPool, workerUrl, storageParent, record }) {
+    const accounts = Array.from({ length: 2 }, () => ({ id: randomUUID(), email: `controlled-${randomUUID()}@example.test` }));
+    const password = `Synthetic-${randomBytes(18).toString('hex')}`;
+    const hash = await hashPassword(password);
+    for (const account of accounts) {
+        await owner.query("INSERT INTO users (id,email,password_hash,email_verified_at,role) VALUES ($1,$2,$3,now(),'user')", [account.id, account.email, hash]);
+    }
+    const modelId = 'acceptance-controlled-image';
+    const pk = randomUUID();
+    await owner.query(`INSERT INTO logical_models (id,logical_model_id,display_name,media_type,supported_operations,enabled)
+        VALUES ($1,$2,'Controlled acceptance fixture','image','["image.generate"]'::jsonb,false)`, [pk, modelId]);
+    const descriptor = { providerInstanceId: 'acceptance-controlled', credentialRef: 'fixture-ref', credentialVersion: 1,
+        adapterType: 'myvigna-image', baseUrl: 'https://provider.example.test/v1', upstreamModel: 'gpt-image-2' };
+    const model = { id: pk, logicalModelId: modelId, enabled: true, mediaType: 'image', catalogVersion: 1,
+        supportedOperations: ['image.generate'], bindings: [{ id: 'fixture-binding', enabled: true, isPrimary: true, bindingVersion: 1,
+            providerInstance: { id: descriptor.providerInstanceId, enabled: true, configVersion: 1, credentialVersion: 1, adapterType: descriptor.adapterType },
+            providerModel: { id: 'fixture-upstream-model', enabled: true, validationState: 'verified', mediaType: 'image',
+                upstreamModelName: descriptor.upstreamModel, capabilities: { operations: ['image.generate'] },
+                adapterVersion: '1', operationProfile: 'image.generate', requestMappingVersion: 1, responseMappingVersion: 1 },
+        }] };
+    const objectStore = createFileObjectStore({ rootDirectory: await mkdtemp(path.join(storageParent, 'controlled-image-')) });
+    const png = Buffer.from(syntheticPng, 'base64');
+    let host;
+    let runOnce;
+    let completeFixture;
+    let ready;
+    const readyPromise = new Promise(resolve => { ready = resolve; });
+    const finished = new Promise(resolve => { completeFixture = resolve; });
+    let calls = 0;
+    await withAssetsHttp(drizzle(webPool), async (request) => {
+        const running = host.run();
+        try {
+            await Promise.race([readyPromise, running.then(() => assert.fail('Worker exited before ready'))]);
+            async function login(account) {
+                const response = await request('/api/auth/login', { method: 'POST', headers: { 'content-type': 'application/json' },
+                    body: JSON.stringify({ email: account.email, password }) });
+                assert.equal(response.status, 200, 'controlled fixture login');
+                const cookie = response.headers.get('set-cookie')?.split(';', 1)[0];
+                assert.ok(cookie, 'controlled fixture requires session cookie');
+                return cookie;
+            }
+            const a = await login(accounts[0]);
+            const b = await login(accounts[1]);
+            const key = `accept:controlled:${randomUUID()}`;
+            const submit = (cookie) => request('/api/tasks', { method: 'POST', headers: {
+                'content-type': 'application/json', 'idempotency-key': key, ...(cookie ? { cookie } : {}),
+            }, body: JSON.stringify({ taskType: 'image.generate', payload: { logicalModelId: modelId,
+                prompt: 'Synthetic fixture only', aspectRatio: '1:1', size: '1024x1024', outputCount: 1 } }) });
+            assert.equal((await submit()).status, 401);
+            assert.equal((await submit(b)).status, 403);
+            const accepted = await submit(a);
+            assert.equal(accepted.status, 201, 'controlled fixture submission');
+            const { task } = await accepted.json();
+            const replay = await submit(a);
+            assert.equal(replay.status, 200);
+            assert.equal((await replay.json()).task.id, task.id);
+            assert.deepEqual(await runOnce(), { status: 'succeeded', taskId: task.id });
+            assert.equal(calls, 1);
+            const detail = await request(`/api/tasks/${task.id}`, { headers: { cookie: a } });
+            assert.equal(detail.status, 200);
+            const { task: done } = await detail.json();
+            assert.equal(done.status, 'succeeded');
+            assert.equal(done.result.archive, 'ready');
+            assert.match(done.result.resultUrl, /^\/api\/assets\/[0-9a-f-]{36}\/content$/);
+            const content = await request(done.result.resultUrl, { headers: { cookie: a } });
+            assert.equal(content.status, 200);
+            assert.equal(content.headers.get('content-type'), 'image/png');
+            assert.deepEqual(Buffer.from(await content.arrayBuffer()), png);
+            assert.equal((await request(done.result.resultUrl, { headers: { cookie: b } })).status, 404);
+            assert.equal((await request(done.result.resultUrl)).status, 401);
+            record('受控单图 HTTP：真实会话、限账号提交及幂等重放、Worker 单次执行、文件归档与授权读取', 'passed');
+        } finally {
+            host.stop();
+            completeFixture();
+            await running;
+        }
+    }, async ({ database, environment, sink }) => {
+        host = await createControlledImageHost({ database, databaseUrl: workerUrl, environment: { ...environment, PAINTTRACK_LOCAL_INTERNAL_GUARD: '1' },
+            sink, ownerId: accounts[0].id, logicalModelId: modelId, catalog: { async getLogicalModel() { return model; } },
+            descriptor, approvedBindings: [descriptor], secretResolver: async () => 'synthetic-fixture-only', objectStore }, {
+            adapterFactory: () => {
+                const adapter = createSyntheticImageAdapter();
+                return { ...adapter, submit(...args) { calls++; return adapter.submit(...args); } };
+            },
+            run: async (options) => {
+                const { worker, pool } = await startWorker(options);
+                try {
+                    runOnce = () => worker.runOnce();
+                    options.onHostLifecycle({ getState: () => 'running', revoke() { options.providerGateControl.revoke(); worker.stop(); } });
+                    ready();
+                    await finished;
+                } finally { worker.stop(); await pool.end(); }
+            },
+        });
+        const detail = createTaskDetailHandler({ database, environment, sink });
+        const content = createAuthorizationHandler('asset.content', { database, environment, sink, objectStore });
+        return (request) => {
+            const pathname = new URL(request.url).pathname;
+            if (pathname === '/api/tasks') return host.submit(request);
+            const task = /^\/api\/tasks\/([0-9a-f-]{36})$/.exec(pathname);
+            if (task) return detail(request, { params: { taskId: task[1] } });
+            const asset = /^\/api\/assets\/([0-9a-f-]{36})\/content$/.exec(pathname);
+            if (asset) return content(request, { params: { id: asset[1] } });
+            return new Response(null, { status: 404 });
+        };
+    });
+}
+
+async function checkLocalMockRoute(workerPool, record, { webPool, owner, database, runtimeRole, workerRole, migrationRole, objectStore, workerUrl, storageParent }) {
     const target = { database, runtimeRole, workerRole, migrationRole };
     // 所有授权/写入前验证实际连接身份，不接受 SET ROLE 伪装或角色名拼接。
     assertAcceptanceIdentities(target, await Promise.all([readIdentity(owner), readIdentity(webPool), readIdentity(workerPool)]));
@@ -91,7 +209,7 @@ async function checkLocalMockRoute(workerPool, record, { webPool, owner, databas
     const getTask = async (id) => (await workerPool.query('SELECT * FROM generation_tasks WHERE id=$1', [id])).rows[0];
     const calls = async (id) => (await workerPool.query('SELECT * FROM provider_calls WHERE task_id=$1 ORDER BY attempt_no', [id])).rows;
     const claim = async (task) => {
-        const claimed = await queue.claimNextTask(workerPool, { workerId, leaseSeconds: 60, taskType: task.task_type });
+        const claimed = await queue.claimNextTask(workerPool, { workerId, leaseSeconds: 60, taskType: task.task_type, taskId: task.id });
         assert.equal(claimed?.id, task.id, '领取必须命中本轮刚创建的精确任务');
         return claimed;
     };
@@ -100,7 +218,7 @@ async function checkLocalMockRoute(workerPool, record, { webPool, owner, databas
         keys.push(idempotencyKey);
         return { ownerId, idempotencyKey, taskType: `${media}.generate`, payload: {
             logicalModelId: `local-mock-${media}`, prompt: 'Synthetic local fixture',
-            ...(media === 'image' ? { aspectRatio: '1:1', size: '1024x1024' } : {}),
+            ...(media === 'image' ? { aspectRatio: '1:1', size: '1024x1024', outputCount: 1 } : { durationMs: 1000, fps: 1 }),
             mock: { mediaType: media === 'image' ? 'image/png' : 'video/mp4', ...mockOptions },
         } };
     };
@@ -143,7 +261,35 @@ async function checkLocalMockRoute(workerPool, record, { webPool, owner, databas
                     await assert.rejects(pool.query(`UPDATE generation_tasks SET ${column}=${column} WHERE id=$1`, [task.id]), error => error.code === '42501');
                 }
             }
-            const claimed = await claim(task);
+            let claimed;
+            if (media === 'image') {
+                const approved = { model_pk: task.logical_model_pk, snapshot_version: task.route_snapshot_version,
+                    snapshot_hash: task.route_snapshot_hash, snapshot: task.route_snapshot, owner_id: ownerId };
+                const scope = { workerId, taskType: task.task_type, taskId: task.id };
+                for (const rejected of [
+                    { ...approved, snapshot_hash: '0'.repeat(64) },
+                    { ...approved, owner_id: randomUUID() },
+                    { ...approved, snapshot: { ...approved.snapshot, logicalModelVersion: 999 } },
+                ]) assert.equal(await queue.claimNextTask(workerPool, { ...scope, approvedRoutes: [rejected] }), null);
+                assert.equal((await getTask(task.id)).attempts, 0);
+                claimed = await queue.claimNextTask(workerPool, { ...scope, approvedRoutes: [approved] });
+                assert.equal(claimed?.id, task.id);
+                assert.equal(claimed.attempts, 1);
+                const originalLease = claimed.lease_token;
+                await owner.query('UPDATE generation_tasks SET lease_expires_at = now() WHERE id=$1', [task.id]);
+                assert.equal(await queue.claimNextTask(workerPool, { ...scope, approvedRoutes: [{ ...approved, snapshot_hash: '0'.repeat(64) }] }), null);
+                const untouched = await getTask(task.id);
+                assert.equal(untouched.status, 'running');
+                assert.equal(untouched.attempts, 1);
+                assert.equal(untouched.lease_token, originalLease);
+                claimed = await queue.claimNextTask(workerPool, { ...scope, approvedRoutes: [approved] });
+                assert.equal(claimed?.id, task.id);
+                assert.equal(claimed.attempts, 2);
+                assert.notEqual(claimed.lease_token, originalLease);
+                record('可信队列领取/租约恢复：不匹配不消耗尝试，不回收他人租约，匹配才重新领取', 'passed');
+            } else {
+                claimed = await claim(task);
+            }
             if (media === 'image') {
                 const before = { submit: invocations.submit.length, query: invocations.query.length };
                 await assert.rejects(execute(claimed, { providerSelector: undefined }), error => error.code === 'TASK_ROUTE_SELECTOR_REQUIRED');
@@ -171,23 +317,21 @@ async function checkLocalMockRoute(workerPool, record, { webPool, owner, databas
             const completed = await getTask(task.id);
             await assertSnapshot(completed, input);
             assert.equal(completed.status, 'succeeded');
-            assert.equal(completed.result.mediaType, media === 'image' ? 'image' : 'video/mp4');
-            assert.equal(completed.result.kind, media === 'image' ? 'asset' : 'mock-asset');
-            assert.equal(completed.result.archive, media === 'image' ? 'ready' : 'not_configured');
+            assert.equal(completed.result.mediaType, media);
+            assert.equal(completed.result.kind, 'asset');
+            assert.equal(completed.result.archive, 'ready');
             assert.equal(completed.result.provider, 'mock-provider');
-            if (media === 'image') {
-                assert.ok(completed.result.assetId);
-                assert.match(completed.result.resultUrl, new RegExp(`/api/assets/${completed.result.assetId}/content$`));
-                // Worker 角色对 assets 只有 id/owner_id/status 的列级 SELECT（刻意不给 storage_key），
-                // 因此归档结果的核对必须走 migration 身份，不能用 workerPool。
-                const asset = await owner.query('SELECT owner_id,status,mime_type,storage_key FROM assets WHERE id=$1', [completed.result.assetId]);
-                assert.equal(asset.rowCount, 1);
-                assert.equal(asset.rows[0].owner_id, ownerId);
-                assert.equal(asset.rows[0].status, 'ready');
-                assert.equal(asset.rows[0].mime_type, 'image/png');
-                const stored = await objectStore.getObject({ key: asset.rows[0].storage_key });
-                assert.equal(stored.body.subarray(0, 8).toString('hex'), '89504e470d0a1a0a');
-            }
+            assert.ok(completed.result.assetId);
+            assert.match(completed.result.resultUrl, new RegExp(`/api/assets/${completed.result.assetId}/content$`));
+            // Worker 无 storage_key 读取权，使用隔离库迁移身份检查归档内容。
+            const asset = await owner.query('SELECT owner_id,status,mime_type,storage_key FROM assets WHERE id=$1', [completed.result.assetId]);
+            assert.equal(asset.rowCount, 1);
+            assert.equal(asset.rows[0].owner_id, ownerId);
+            assert.equal(asset.rows[0].status, 'ready');
+            assert.equal(asset.rows[0].mime_type, media === 'image' ? 'image/png' : 'video/mp4');
+            const stored = await objectStore.getObject({ key: asset.rows[0].storage_key });
+            if (media === 'image') assert.equal(stored.body.subarray(0, 8).toString('hex'), '89504e470d0a1a0a');
+            else assert.equal(stored.body.subarray(4, 8).toString('ascii'), 'ftyp');
             assert.equal(completed.lease_token, null);
             const [call] = await calls(task.id);
             assert.equal(call.status, 'succeeded');
@@ -268,6 +412,8 @@ async function checkLocalMockRoute(workerPool, record, { webPool, owner, databas
         assert.equal(invocations.submit.length + invocations.query.length, invocationCount);
         assert.equal(invocations.fallback, 0);
         record('本地mock历史provider_name冲突：保留unknown及原键，零Provider调用', 'passed');
+        assert.ok(workerUrl && storageParent, 'controlled image fixture requires isolated worker and storage');
+        await checkControlledImage({ owner, webPool, workerUrl, storageParent, record });
     } finally {
         // 即使并发提交部分失败，也从登记的精确 owner+key 找回本轮 ID，再由 migration 清理。
         try {

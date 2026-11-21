@@ -78,7 +78,8 @@ test('TOTP 密钥使用 AES-256-GCM 加密，篡改或错误密钥不能解密',
         secret_nonce: encrypted.secretNonce,
         secret_tag: encrypted.secretTag,
     }, key), secret);
-    assert.throws(() => decryptSecret({ ...encrypted, secretTag: `A${encrypted.secretTag.slice(1)}` }, key));
+    const alteredTag = `${encrypted.secretTag[0] === 'A' ? 'B' : 'A'}${encrypted.secretTag.slice(1)}`;
+    assert.throws(() => decryptSecret({ ...encrypted, secretTag: alteredTag }, key));
     assert.throws(() => decryptSecret(encrypted, randomBytes(32).toString('hex')));
 });
 

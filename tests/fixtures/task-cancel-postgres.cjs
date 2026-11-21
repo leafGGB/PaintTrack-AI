@@ -81,8 +81,13 @@ async function runChecks(pool, record, createdTasks, workerPool) {
 
     // 4. running 任务：只登记意图，状态仍由持有租约的执行方推进。
     const runningId = await createTask(pool, OWNER_A, 'running', createdTasks);
-    const claimed = await queue.claimNextTask(workerPool, { workerId: 'cancel-fixture-worker', leaseSeconds: 30 });
+    const claimed = await queue.claimNextTask(workerPool, {
+        workerId: 'cancel-fixture-worker',
+        leaseSeconds: 30,
+        taskType: 'task-cancel-fixture',
+    });
     assert.ok(claimed);
+    assert.equal(claimed.id, runningId);
     const requested = await cancel({ ownerId: OWNER_A, taskId: claimed.id });
     assert.equal(requested.outcome, 'requested');
     assert.equal(requested.task.status, 'running');
@@ -112,7 +117,12 @@ async function runChecks(pool, record, createdTasks, workerPool) {
 
     // 6. 租约过期但已登记取消：恢复时必须终结为 cancelled，而不是回队列再执行一次。
     const expiredId = await createTask(pool, OWNER_A, 'expired-cancel', createdTasks);
-    const expiredClaim = await queue.claimNextTask(workerPool, { workerId: 'cancel-fixture-worker', leaseSeconds: 30 });
+    const expiredClaim = await queue.claimNextTask(workerPool, {
+        workerId: 'cancel-fixture-worker',
+        leaseSeconds: 30,
+        taskType: 'task-cancel-fixture',
+    });
+    assert.ok(expiredClaim);
     assert.equal(expiredClaim.id, expiredId);
     await cancel({ ownerId: OWNER_A, taskId: expiredId });
     await workerPool.query("UPDATE generation_tasks SET lease_expires_at = now() - interval '1 second' WHERE id=$1",

@@ -216,7 +216,7 @@ async function localRoutedTask(media = 'image', payload = {}) {
     const { createLocalMockCatalog } = require('../lib/server/tasks/localMockCatalog');
     const { createModelRouteResolver } = require('../lib/server/tasks/modelRouteResolver');
     const env = { NODE_ENV: 'development', PAINTTRACK_LOCAL_INTERNAL_GUARD: '1', PAINTTRACK_LOCAL_MOCK_ROUTING: '1' };
-    const task = baseTask({ task_type: `${media}.generate`, payload: { logicalModelId: `local-mock-${media}`, ...payload } });
+    const task = baseTask({ task_type: `${media}.generate`, payload: { logicalModelId: `local-mock-${media}`, ...(media === 'image' ? { outputCount: 1 } : { durationMs: 1000, fps: 1 }), ...payload } });
     const route = await createModelRouteResolver({ catalog: createLocalMockCatalog(env) }).resolve({ taskType: task.task_type, payload: task.payload });
     return { env, task: { ...task, logical_model_pk: route.logicalModelPk, route_snapshot: route.routeSnapshot,
         route_snapshot_version: route.routeSnapshotVersion, route_snapshot_hash: route.routeSnapshotHash } };
@@ -730,6 +730,216 @@ test('createTaskProcessor 把绑定的连接池交给归档器，图片结果可
         assert.equal(completed.result.assetId, assetId);
         assert.ok(statements.some((text) => text.includes('INSERT INTO assets')));
     });
+});
+
+test('受控单图宿主仅在 Worker 就绪时接受指定会话，提交和领取使用同一冻结目录', async () => {
+    const { createControlledImageHost } = require('../lib/server/worker');
+    const { randomBytes } = require('node:crypto');
+    const ownerId = '33333333-3333-4333-8333-333333333333';
+    const otherId = '44444444-4444-4444-8444-444444444444';
+    const modelId = 'controlled-image';
+    const binding = { providerInstanceId: 'controlled-provider', credentialRef: 'controlled-ref', credentialVersion: 1,
+        adapterType: 'myvigna-image', baseUrl: 'https://provider.example.test/v1', upstreamModel: 'gpt-image-2' };
+    const model = { id: '77777777-7777-4777-8777-777777777777', logicalModelId: modelId,
+        mediaType: 'image', enabled: true, catalogVersion: 1, supportedOperations: ['image.generate'], bindings: [{
+            id: 'controlled-binding', enabled: true, isPrimary: true, bindingVersion: 1,
+            providerInstance: { id: binding.providerInstanceId, enabled: true, configVersion: 1,
+                credentialVersion: 1, adapterType: binding.adapterType },
+            providerModel: { id: 'controlled-model', enabled: true, validationState: 'verified', mediaType: 'image',
+                upstreamModelName: binding.upstreamModel, capabilities: { operations: ['image.generate'] },
+                adapterVersion: '1', operationProfile: 'image.generate', requestMappingVersion: 1, responseMappingVersion: 1 },
+        }] };
+    let account = ownerId;
+    let row;
+    let writes = 0;
+    const database = { async execute() { return { rows: [{ id: account, role: 'user', auth_level: 'password' }] }; },
+        $client: { async connect() { return { release() {}, async query(sql, params) {
+            if (sql.includes('INSERT INTO generation_tasks')) {
+                writes++;
+                row = { id: taskId, owner_id: params[0], task_type: params[3], payload: JSON.parse(params[4]),
+                    logical_model_pk: params[7], route_snapshot: JSON.parse(params[8]), route_snapshot_version: params[9],
+                    route_snapshot_hash: params[10], status: 'queued', created_at: new Date(), updated_at: new Date() };
+                return { rows: [row], rowCount: 1 };
+            }
+            assert.match(sql, /^(BEGIN|COMMIT|ROLLBACK|SELECT \*)/);
+            return { rows: [], rowCount: 0 };
+        } }; } } };
+    const origin = 'https://painttrack.example.test';
+    const environment = { APP_BASE_URL: origin, NODE_ENV: 'development', PAINTTRACK_LOCAL_INTERNAL_GUARD: '1' };
+    const token = randomBytes(32).toString('base64url');
+    const post = (host, id = modelId) => host.submit(new Request(`${origin}/api/tasks`, { method: 'POST', headers: {
+        origin, cookie: `painttrack_session=${token}`, 'content-type': 'application/json', 'idempotency-key': 'controlled-image-0001',
+    }, body: JSON.stringify({ taskType: 'image.generate', payload: { logicalModelId: id, prompt: 'Fixture',
+        aspectRatio: '1:1', size: '1024x1024', outputCount: 1 } }) }));
+    const objectStore = { async putObject() { assert.fail('无实际归档'); }, async deleteObject() {} };
+    const config = { catalog: { getLogicalModel: async () => model }, logicalModelId: modelId, ownerId, database,
+        databaseUrl: 'postgres://unused/worker', environment, descriptor: binding, approvedBindings: [binding],
+        secretResolver: async () => 'synthetic-secret', objectStore, sink: { info() {}, warn() {}, error() {} } };
+    await assert.rejects(createControlledImageHost({ ...config, objectStore: undefined }), { code: 'CONTROLLED_IMAGE_HOST_CONFIG_INVALID' });
+    await assert.rejects(createControlledImageHost({ ...config, environment: { ...environment, PAINTTRACK_CHARGED_SUBMISSION: '1' } }),
+        { code: 'CONTROLLED_IMAGE_HOST_CONFIG_INVALID' });
+    const adapter = { name: 'controlled-fixture', submit() { assert.fail('无真实上游'); },
+        query() { assert.fail('无真实上游'); }, cancel() { assert.fail('无真实上游'); } };
+    let revoked = false;
+    const host = await createControlledImageHost(config, {
+        adapterFactory: () => adapter,
+        createTaskProcessor: (options) => options,
+        run: (worker) => (async () => {
+            assert.equal((await post(host)).status, 503);
+            worker.onHostLifecycle({ getState: () => revoked ? 'revoked' : 'running', revoke() { revoked = true; } });
+            assert.equal(host.getState(), 'ready');
+            account = otherId;
+            assert.equal((await post(host)).status, 403);
+            account = ownerId;
+            assert.equal((await post(host, 'other-image')).status, 409);
+            assert.equal(writes, 0);
+            assert.equal((await post(host)).status, 201);
+            assert.equal(worker.approvedRoutes[0].owner_id, ownerId);
+            assert.equal(row.route_snapshot.logicalModelVersion, 1);
+            assert.equal(worker.approvedRoutes[0].snapshot_hash, row.route_snapshot_hash);
+            const processor = worker.createProcessor({ pool: {} });
+            assert.equal(processor.objectStore, objectStore);
+            await processor.providerSelector.select(row);
+            await assert.rejects(processor.providerSelector.select({ ...row, owner_id: otherId }));
+            assert.equal(host.stop(), true);
+            assert.equal((await post(host)).status, 503);
+        })().then(() => null, (error) => error),
+    });
+    model.catalogVersion = 2;
+    assert.equal((await post(host)).status, 503);
+    const runError = await host.run();
+    if (runError) throw runError;
+    assert.equal(revoked, true);
+    assert.equal(host.getState(), 'closed');
+    assert.equal((await post(host)).status, 503);
+    assert.equal(writes, 1);
+});
+
+test('可信单图从 HTTP 入队到私有归档，目录变更不重写快照或提交上游', async () => {
+    const { randomBytes } = require('node:crypto');
+    const { createRoutedTaskHandler } = require('../lib/server/tasks/taskHttp');
+    const { bootstrapWorker } = require('../lib/server/worker');
+    const { createTaskProcessor } = require('../lib/server/worker/taskExecutor');
+    const ownerId = '33333333-3333-4333-8333-333333333333';
+    const assetId = '66666666-6666-4666-8666-666666666666';
+    const binding = { providerInstanceId: 'synthetic-image', credentialRef: 'fixture-ref', credentialVersion: 1,
+        adapterType: 'myvigna-image', baseUrl: 'https://provider.example.test/v1', upstreamModel: 'gpt-image-2' };
+    const model = { id: '77777777-7777-4777-8777-777777777777', logicalModelId: 'trusted-image',
+        mediaType: 'image', enabled: true, catalogVersion: 1, supportedOperations: ['image.generate'], bindings: [{
+            id: 'synthetic-binding', enabled: true, isPrimary: true, bindingVersion: 1,
+            providerInstance: { id: binding.providerInstanceId, enabled: true, configVersion: 1,
+                credentialVersion: binding.credentialVersion, adapterType: binding.adapterType },
+            providerModel: { id: 'synthetic-model', enabled: true, validationState: 'verified', mediaType: 'image',
+                upstreamModelName: binding.upstreamModel, capabilities: { operations: ['image.generate'] },
+                adapterVersion: '1', operationProfile: 'image.generate', requestMappingVersion: 1, responseMappingVersion: 1 },
+        }] };
+    let catalogVersion = 1;
+    const catalog = { async getLogicalModel(id) { return id === model.logicalModelId ? { ...model, catalogVersion } : null; } };
+    let storedTask;
+    let ready = false;
+    const objects = new Map();
+    const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/l9sAAAAASUVORK5CYII=', 'base64');
+    const pool = {
+        async query() { assert.fail('预期所有 SQL 都在连接事务中'); },
+        async connect() {
+            return { release() {}, async query(sql, params) {
+                if (/^(BEGIN|COMMIT|ROLLBACK)$/.test(sql)) return { rows: [], rowCount: 0 };
+                if (sql.includes('SELECT * FROM generation_tasks')) {
+                    const rows = storedTask && storedTask.owner_id === params[0] && storedTask.idempotency_key === params[1] ? [storedTask] : [];
+                    return { rows, rowCount: rows.length };
+                }
+                if (sql.includes('INSERT INTO generation_tasks')) {
+                    assert.equal(storedTask, undefined);
+                    assert.match(sql, /logical_model_pk, route_snapshot, route_snapshot_version, route_snapshot_hash/);
+                    const [owner_id, idempotency_key, request_fingerprint, task_type, payload, , , logical_model_pk,
+                        route_snapshot, route_snapshot_version, route_snapshot_hash] = params;
+                    storedTask = { id: taskId, owner_id, idempotency_key, request_fingerprint, task_type,
+                        payload: JSON.parse(payload), logical_model_pk, route_snapshot: JSON.parse(route_snapshot),
+                        route_snapshot_version, route_snapshot_hash, status: TASK_STATUS.QUEUED,
+                        created_at: new Date(), updated_at: new Date() };
+                    return { rows: [storedTask], rowCount: 1 };
+                }
+                if (sql.includes('INSERT INTO assets')) {
+                    assert.deepEqual(params.slice(0, 4), [ownerId, 'image', 'image/png', png.length]);
+                    return { rows: [{ id: assetId }], rowCount: 1 };
+                }
+                if (sql.includes("UPDATE assets SET status='ready'")) {
+                    ready = true;
+                    return { rows: [{ id: assetId }], rowCount: 1 };
+                }
+                assert.fail(`未预期的 SQL: ${sql}`);
+            } };
+        },
+    };
+    const origin = 'https://painttrack.example.test';
+    const token = randomBytes(32).toString('base64url');
+    const handler = createRoutedTaskHandler({ catalog, environment: { APP_BASE_URL: origin },
+        sink: { info() {}, warn() {}, error() {} }, database: { $client: pool,
+            async execute() { return { rows: [{ id: ownerId, role: 'user', auth_level: 'password' }] }; } } });
+    const post = () => handler(new Request(`${origin}/api/tasks`, { method: 'POST', headers: {
+        origin, cookie: `painttrack_session=${token}`, 'content-type': 'application/json', 'idempotency-key': 'synthetic-image-0001',
+    }, body: JSON.stringify({ taskType: 'image.generate', payload: { logicalModelId: model.logicalModelId,
+        prompt: 'An offline fixture', aspectRatio: '1:1', size: '1024x1024', outputCount: 1 } }) }));
+    const response = await post();
+    assert.equal(response.status, 201);
+    const body = await response.json();
+    assert.equal(body.task.id, taskId);
+    assert.equal(body.task.routeSnapshot, undefined);
+    assert.equal(storedTask.owner_id, ownerId);
+    const originalHash = storedTask.route_snapshot_hash;
+    catalogVersion = 2;
+    const replay = await post();
+    assert.equal(replay.status, 200);
+    assert.equal(replay.headers.get('Idempotency-Replayed'), 'true');
+    assert.equal(storedTask.route_snapshot_hash, originalHash);
+
+    let submissions = 0;
+    let completed;
+    const ledger = createLedgerFake();
+    await withStubs({ ledger, onComplete: (result) => { completed = result; } }, async () => {
+        const run = async (historicalCatalogs) => {
+            const runError = await bootstrapWorker({ descriptor: binding, approvedBindings: [binding], secretResolver: async () => 'offline-fixture',
+                trustedCatalog: catalog, historicalCatalogs, logicalModelId: model.logicalModelId, workerId: 'worker-trusted-image' }, {
+            adapterFactory: () => ({ name: 'synthetic-image-adapter', async submit() {
+                submissions++;
+                return { kind: 'completed', providerJobId: 'offline-image-1', providerState: 'succeeded',
+                    result: { mediaType: 'image', mimeType: 'image/png', bytes: png } };
+            }, async query() { assert.fail('同步结果不轮询'); }, async cancel() { assert.fail('未请求取消'); } }),
+            createTaskProcessor: (config) => createTaskProcessor({ ...config, objectStore: {
+                async putObject({ key, body, acl }) { assert.equal(acl, 'private'); objects.set(key, Buffer.from(body)); },
+                async deleteObject({ key }) { objects.delete(key); },
+            } }),
+            run: ({ createProcessor, approvedRoutes, taskType }) => (async () => {
+                assert.equal(taskType, 'image.generate');
+                assert.equal(approvedRoutes.length, historicalCatalogs ? 2 : 1);
+                const processTask = createProcessor({ pool });
+                // 从提交层保存的同一行构造领取后的任务，不重新生成快照。
+                const claimed = { ...storedTask, status: TASK_STATUS.RUNNING, attempts: 1, lease_token: 'offline-lease' };
+                assert.equal(approvedRoutes.some(route => route.snapshot_hash === originalHash), Boolean(historicalCatalogs));
+                if (!historicalCatalogs) {
+                    await assert.rejects(processTask(claimed), { code: 'TASK_ROUTE_REJECTED' });
+                    assert.equal(submissions, 0);
+                    assert.equal(ledger.ofTask().length, 0);
+                    assert.equal(objects.size, 0);
+                    return;
+                }
+                const outcome = await processTask(claimed);
+                assert.equal(outcome.status, TASK_STATUS.SUCCEEDED);
+                assert.equal(outcome.result.archive, 'ready');
+                assert.equal(outcome.result.resultUrl, `/api/assets/${assetId}/content`);
+            })().then(() => null, (error) => error),
+            });
+            if (runError) throw runError;
+        };
+        await run();
+        await run([{ async getLogicalModel(id) { return id === model.logicalModelId ? model : null; } }]);
+    });
+    assert.equal(catalogVersion, 2);
+    assert.equal(submissions, 1);
+    assert.equal(ledger.ofTask().length, 1);
+    assert.equal(ready, true);
+    assert.equal(completed.result.assetId, assetId);
+    assert.deepEqual([...objects], [[`users/${ownerId}/assets/${assetId}`, png]]);
 });
 
 // 真实 Provider（如 MyVigna）只返回结果 URL。若不先抓成二进制，

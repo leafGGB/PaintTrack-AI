@@ -36,6 +36,21 @@ test('mock provider exposes capabilities and completes synchronous jobs', async 
     assert.equal(provider._testing.jobCount(), 1);
 });
 
+test('mock provider returns a local playable video fixture for video tasks', async () => {
+    const provider = createMockProvider();
+    const submitted = await provider.submit(request(
+        { mock: { mode: 'sync', mediaType: 'video/mp4' } },
+        { taskType: 'video.generate', idempotencyKey: 'video-task-1' },
+    ));
+    assert.equal(submitted.kind, 'completed');
+    assert.equal(submitted.result.mediaType, 'video');
+    assert.equal(submitted.result.mimeType, 'video/mp4');
+    assert.equal(submitted.result.source, 'local-mock-demo-video');
+    assert.ok(Buffer.isBuffer(submitted.result.bytes));
+    assert.equal(submitted.result.bytes.subarray(4, 8).toString(), 'ftyp');
+    assert.ok(submitted.result.bytes.length > 1000);
+});
+
 test('mock provider supports asynchronous query lifecycle and submit idempotency', async () => {
     const provider = createMockProvider();
     const input = request({ mock: { mode: 'async' } });

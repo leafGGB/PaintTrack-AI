@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 function formatDate(value, locale) {
   if (!value) return locale === 'zh' ? '暂无数据' : 'Not available';
@@ -11,6 +11,20 @@ function formatDate(value, locale) {
     timeStyle: 'short',
   }).format(date);
 }
+
+function formatCredits(tenths) {
+  const value = BigInt(String(tenths || '0'));
+  const whole = value / 10n;
+  const fraction = value % 10n;
+  return `${whole}.${fraction}`;
+}
+
+const eventTone = {
+  reserve: 'text-amber-100',
+  settle: 'text-rose-100',
+  release: 'text-emerald-100',
+  grant: 'text-cyan-100',
+};
 
 async function mfaRequest(path, body) {
   const response = await fetch(`/api/auth/mfa/${path}`, {
@@ -33,6 +47,12 @@ export default function AccountCenter({ locale = 'en' }) {
   const [copied, setCopied] = useState(false);
   const [loggingOut, setLoggingOut] = useState(false);
   const [mfaStatus, setMfaStatus] = useState(null);
+  const [creditsStatus, setCreditsStatus] = useState('loading');
+  const [credits, setCredits] = useState(null);
+  const [creditKind, setCreditKind] = useState('');
+  const [creditsLoadingMore, setCreditsLoadingMore] = useState(false);
+  const [creditsMoreError, setCreditsMoreError] = useState(false);
+  const creditsRequestRef = useRef({ sequence: 0, controller: null });
   const [mfaLoading, setMfaLoading] = useState(false);
   const [enrollment, setEnrollment] = useState(null);
   const [verificationCode, setVerificationCode] = useState('');
@@ -45,8 +65,8 @@ export default function AccountCenter({ locale = 'en' }) {
     eyebrow: '账户 / 概览', title: '账户中心', subtitle: '查看当前登录身份与账户功能状态。',
     identity: '账户身份', email: '邮箱地址', id: '用户 ID', role: '账户角色', verified: '邮箱验证',
     verifiedYes: '已验证', created: '账户创建时间', copy: '复制 ID', copied: '已复制',
-    quota: '额度与账单', unavailable: '额度服务尚未启用', quotaHint: '当前不会显示余额、消费或账单数据。接入权威账本后，这里才会展示真实额度与流水。',
-    usage: '使用记录', usageHint: '任务用量与用户扣点尚未接入。现阶段不会展示伪造记录。',
+    quota: '额度与账单', available: '可用额度', reserved: '冻结额度', total: '总额度', unit: 'credit', loadingCredits: '正在读取真实额度…', creditsError: '额度与账单暂时无法读取，请稍后重试。', retryCredits: '重新读取', emptyLedger: '暂无账单流水', more: '加载更多', loadingMore: '正在加载…', moreError: '加载更多失败，列表未改变，请重试。', refresh: '刷新账单', filter: '账单类型', all: '全部', freezeHint: '冻结表示额度占用，结算才会实际扣除；释放不是新增赠送。', task: '任务', event: { reserve: '冻结', settle: '结算扣除', release: '释放冻结', grant: '额度发放' },
+    usage: '使用记录', usageHint: '任务用量与用户扣点记录会显示在上方账单流水中。',
     security: '管理员安全', mfaTitle: '多因素认证（MFA）', mfaEnabled: '已启用', mfaDisabled: '未启用', mfaPending: '等待验证', mfaRevoked: '已撤销',
     mfaDescription: '使用身份验证器保护管理员操作。密钥和恢复码只在对应流程中显示。', begin: '开始设置 MFA', beginAgain: '重新设置', verify: '验证并启用', verifying: '正在验证…', secret: '手动录入密钥', algorithm: '算法', period: '周期',
     recovery: '恢复码', issueRecovery: '签发新的恢复码', issuing: '正在签发…', recoveryHint: '恢复码只显示这一次。请复制并保存在安全位置；签发新一组会使旧恢复码失效。', copyRecovery: '复制恢复码', copiedRecovery: '已复制恢复码',
@@ -58,8 +78,8 @@ export default function AccountCenter({ locale = 'en' }) {
     eyebrow: 'ACCOUNT / OVERVIEW', title: 'Account center', subtitle: 'Review the signed-in identity and account feature status.',
     identity: 'Account identity', email: 'Email address', id: 'User ID', role: 'Account role', verified: 'Email verification',
     verifiedYes: 'Verified', created: 'Account created', copy: 'Copy ID', copied: 'Copied',
-    quota: 'Credits & billing', unavailable: 'Credit service is not enabled', quotaHint: 'Balance, spending, and billing data are not available yet. Real credits and ledger entries will appear here only after the authoritative ledger is connected.',
-    usage: 'Usage history', usageHint: 'Task usage and user charges are not connected yet. No fabricated activity is shown.',
+    quota: 'Credits & billing', available: 'Available', reserved: 'Reserved', total: 'Total', unit: 'credit', loadingCredits: 'Loading live credit data…', creditsError: 'Credit and billing data is temporarily unavailable.', retryCredits: 'Reload credits', emptyLedger: 'No ledger entries yet', more: 'Load more', loadingMore: 'Loading…', moreError: 'Loading more failed; the list is unchanged. Try again.', refresh: 'Refresh ledger', filter: 'Ledger type', all: 'All', freezeHint: 'Reserved means credits are occupied; settlement is the actual deduction. Release is not a new grant.', task: 'Task', event: { reserve: 'Reserved', settle: 'Settled', release: 'Released', grant: 'Granted' },
+    usage: 'Usage history', usageHint: 'Task usage and credit events appear in the ledger above.',
     security: 'ADMIN SECURITY', mfaTitle: 'Multi-factor authentication', mfaEnabled: 'Enabled', mfaDisabled: 'Not enabled', mfaPending: 'Verification pending', mfaRevoked: 'Revoked',
     mfaDescription: 'Protect administrator actions with an authenticator app. Secrets and recovery codes are shown only during their respective flows.', begin: 'Set up MFA', beginAgain: 'Set up again', verify: 'Verify and enable', verifying: 'Verifying…', secret: 'Manual setup key', algorithm: 'Algorithm', period: 'Period',
     recovery: 'Recovery codes', issueRecovery: 'Issue new recovery codes', issuing: 'Issuing…', recoveryHint: 'Recovery codes are shown once. Store them securely; issuing a new set invalidates the previous set.', copyRecovery: 'Copy recovery codes', copiedRecovery: 'Recovery codes copied',
@@ -68,6 +88,43 @@ export default function AccountCenter({ locale = 'en' }) {
     loading: 'Verifying account identity…', error: 'Account information is temporarily unavailable. Refresh and try again.', retry: 'Reload', backToStudio: 'Back to studio', signOut: 'Sign out securely', signingOut: 'Signing out…',
     roleUser: 'User', roleAdmin: 'Administrator',
   };
+
+  async function loadCredits({ append = false, cursor = null, kind = creditKind } = {}) {
+    const request = creditsRequestRef.current;
+    if (!append) {
+      request.sequence += 1;
+      request.controller?.abort();
+      request.controller = new AbortController();
+      setCreditsStatus('loading');
+      setCreditsLoadingMore(false);
+      setCreditsMoreError(false);
+    } else {
+      setCreditsLoadingMore(true);
+      setCreditsMoreError(false);
+    }
+    const sequence = request.sequence;
+    const query = new URLSearchParams({ limit: '20' });
+    if (kind) query.set('kind', kind);
+    if (cursor) query.set('cursor', cursor);
+    try {
+      const response = await fetch(`/api/account/credits?${query}`, { cache: 'no-store', credentials: 'same-origin', signal: request.controller?.signal });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok || !result.credits) throw new Error('CREDIT_UNAVAILABLE');
+      if (sequence !== request.sequence) return;
+      setCredits((current) => {
+        if (!append || !current) return result.credits;
+        const ids = new Set((current.events || []).map((event) => event.id));
+        return { ...result.credits, events: [...(current.events || []), ...(result.credits.events || []).filter((event) => !ids.has(event.id))] };
+      });
+      setCreditsStatus('ready');
+    } catch (error) {
+      if (error.name === 'AbortError' || sequence !== request.sequence) return;
+      if (append) setCreditsMoreError(true);
+      else setCreditsStatus('error');
+    } finally {
+      if (sequence === request.sequence) setCreditsLoadingMore(false);
+    }
+  }
 
   async function loadMfaStatus() {
     try {
@@ -92,10 +149,14 @@ export default function AccountCenter({ locale = 'en' }) {
         }
         setUser(result.user);
         setStatus('ready');
+        loadCredits();
         if (result.user.role === 'admin') loadMfaStatus();
       })
       .catch(() => { if (active) setStatus('error'); });
-    return () => { active = false; };
+    return () => {
+      active = false;
+      creditsRequestRef.current.controller?.abort();
+    };
   }, []);
 
   async function copyUserId() {
@@ -269,7 +330,7 @@ export default function AccountCenter({ locale = 'en' }) {
           {mfaStatus?.enabled && user.authLevel === 'mfa' && <div className="mt-6 rounded-lg border border-white/[0.08] bg-white/[0.025] p-4"><label className="block max-w-xl"><span className="mb-1.5 block text-xs text-white/55">{text.managementProof}</span><input value={managementCode} onChange={(event) => setManagementCode(event.target.value.toUpperCase().replace(/[^A-Z0-9 -]/g, '').slice(0, 32))} autoComplete="one-time-code" className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 font-mono text-sm text-white outline-none focus:border-cyan-300/60" /></label><div className="mt-4 flex flex-wrap gap-2"><button type="button" onClick={issueRecoveryCodes} disabled={mfaLoading || !managementCode} className="rounded-md border border-white/10 px-3 py-2 text-xs text-white/75 hover:bg-white/[0.06] disabled:cursor-wait disabled:opacity-50">{mfaLoading ? text.issuing : text.issueRecovery}</button><button type="button" onClick={revokeMfa} disabled={mfaLoading || !managementCode} className="rounded-md border border-rose-300/20 px-3 py-2 text-xs text-rose-100/80 hover:bg-rose-300/[0.08] disabled:cursor-wait disabled:opacity-50">{confirmRevoke ? text.revokeConfirm : text.revokeFactor}</button></div>{recoveryCodes && <div className="mt-4"><pre className="grid gap-1 rounded-md bg-black/35 p-4 font-mono text-sm tracking-[0.12em] text-amber-100">{recoveryCodes.join('\n')}</pre><button type="button" onClick={copyRecoveryCodes} className="mt-3 rounded border border-white/10 px-3 py-2 text-xs text-white/70 hover:bg-white/[0.06]">{text.copyRecovery}</button></div>}</div>}
         </section>}
 
-        <div className="mt-5 grid gap-5 md:grid-cols-2"><section aria-labelledby="account-quota-title" className="rounded-xl border border-white/[0.08] bg-[#0a0a0b] p-5 sm:p-6"><p className="text-[10px] font-semibold tracking-[0.18em] text-white/35">01 / ACCOUNT</p><h2 id="account-quota-title" className="mt-3 text-base font-semibold">{text.quota}</h2><p className="mt-4 inline-flex rounded-full border border-amber-200/15 bg-amber-200/[0.06] px-3 py-1.5 text-xs text-amber-100/80">{text.unavailable}</p><p className="mt-3 text-sm leading-6 text-white/45">{text.quotaHint}</p></section><section aria-labelledby="account-usage-title" className="rounded-xl border border-white/[0.08] bg-[#0a0a0b] p-5 sm:p-6"><p className="text-[10px] font-semibold tracking-[0.18em] text-white/35">02 / ACTIVITY</p><h2 id="account-usage-title" className="mt-3 text-base font-semibold">{text.usage}</h2><p className="mt-4 text-sm leading-6 text-white/45">{text.usageHint}</p></section></div>
+        <div className="mt-5 grid gap-5 md:grid-cols-2"><section aria-labelledby="account-quota-title" className="rounded-xl border border-white/[0.08] bg-[#0a0a0b] p-5 sm:p-6 md:col-span-2"><p className="text-[10px] font-semibold tracking-[0.18em] text-white/35">01 / ACCOUNT</p><h2 id="account-quota-title" className="mt-3 text-base font-semibold">{text.quota}</h2>{creditsStatus === 'loading' && <p role="status" className="mt-4 text-sm text-white/45">{text.loadingCredits}</p>}{creditsStatus === 'error' && <div className="mt-4 flex flex-wrap items-center gap-3"><p role="alert" className="text-sm text-amber-100/80">{text.creditsError}</p><button type="button" onClick={loadCredits} className="rounded-md border border-white/10 px-3 py-1.5 text-xs text-white/70 hover:bg-white/[0.06] focus-visible:outline focus-visible:outline-2 focus-visible:outline-cyan-300">{text.retryCredits}</button></div>}{creditsStatus === 'ready' && credits && <><dl className="mt-5 grid gap-3 sm:grid-cols-3"><div className="rounded-lg border border-cyan-200/15 bg-cyan-200/[0.05] p-4"><dt className="text-xs text-white/45">{text.available}</dt><dd className="mt-2 text-2xl font-semibold text-cyan-100">{formatCredits(credits.availableTenths)} <span className="text-xs font-normal text-white/45">{text.unit}</span></dd></div><div className="rounded-lg border border-amber-200/15 bg-amber-200/[0.05] p-4"><dt className="text-xs text-white/45">{text.reserved}</dt><dd className="mt-2 text-2xl font-semibold text-amber-100">{formatCredits(credits.reservedTenths)} <span className="text-xs font-normal text-white/45">{text.unit}</span></dd></div><div className="rounded-lg border border-white/[0.08] bg-white/[0.025] p-4"><dt className="text-xs text-white/45">{text.total}</dt><dd className="mt-2 text-2xl font-semibold text-white/90">{formatCredits(credits.totalTenths)} <span className="text-xs font-normal text-white/45">{text.unit}</span></dd></div></dl><div className="mt-6 border-t border-white/[0.07] pt-5"><div className="flex flex-wrap items-center justify-between gap-3"><h3 className="text-sm font-semibold">{text.usage}</h3><div className="flex items-center gap-2"><label htmlFor="credit-kind" className="text-xs text-white/45">{text.filter}</label><select id="credit-kind" value={creditKind} onChange={(event) => { const kind = event.target.value; setCreditKind(kind); loadCredits({ kind }); }} className="rounded-md border border-white/10 bg-black/30 px-2 py-1.5 text-xs text-white/75"><option value="">{text.all}</option><option value="grant">{text.event.grant}</option><option value="reserve">{text.event.reserve}</option><option value="settle">{text.event.settle}</option><option value="release">{text.event.release}</option></select><button type="button" onClick={() => loadCredits()} disabled={creditsLoadingMore} className="rounded-md border border-white/10 px-2 py-1.5 text-xs text-white/65 hover:bg-white/[0.06] disabled:opacity-50">{text.refresh}</button></div></div><p className="mt-2 text-xs leading-5 text-white/40">{text.freezeHint}</p>{credits.events.length === 0 ? <p className="mt-3 text-sm text-white/40">{text.emptyLedger}</p> : <ul className="mt-3 divide-y divide-white/[0.06]">{credits.events.map((event) => <li key={event.id} className="flex flex-wrap items-center justify-between gap-3 py-3 first:pt-0"><div><p className={`text-sm ${eventTone[event.kind] || 'text-white/80'}`}>{text.event[event.kind] || event.kind}</p><p className="mt-1 text-xs text-white/35">{formatDate(event.createdAt, locale)}{event.taskId ? ` · ${event.taskId}` : ''}{event.task ? ` · ${text.task}: ${event.task.taskType} (${event.task.status})` : ''}</p></div><span className="font-mono text-sm text-white/80">{event.kind === 'grant' ? '+' : event.kind === 'settle' ? '-' : ''}{formatCredits(event.amountTenths)} {text.unit}</span></li>)}</ul>}{creditsMoreError && <div className="mt-3 flex flex-wrap items-center gap-3"><p role="alert" className="text-xs text-amber-100/80">{text.moreError}</p><button type="button" onClick={() => loadCredits({ append: true, cursor: credits.nextCursor })} disabled={creditsLoadingMore} className="rounded-md border border-white/10 px-3 py-1.5 text-xs text-white/70 hover:bg-white/[0.06] disabled:opacity-50">{text.more}</button></div>}{credits.nextCursor && !creditsMoreError && <button type="button" onClick={() => loadCredits({ append: true, cursor: credits.nextCursor })} disabled={creditsLoadingMore} className="mt-4 w-full rounded-md border border-white/10 px-3 py-2 text-xs text-white/70 hover:bg-white/[0.06] disabled:opacity-50">{creditsLoadingMore ? text.loadingMore : text.more}</button>}</div></>}</section><section aria-labelledby="account-usage-title" className="rounded-xl border border-white/[0.08] bg-[#0a0a0b] p-5 sm:p-6 md:col-span-2"><p className="text-[10px] font-semibold tracking-[0.18em] text-white/35">02 / ACTIVITY</p><h2 id="account-usage-title" className="mt-3 text-base font-semibold">{text.usage}</h2><p className="mt-4 text-sm leading-6 text-white/45">{text.usageHint}</p></section></div>
       </div>
     </main>
   );

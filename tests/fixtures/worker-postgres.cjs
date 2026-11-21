@@ -3,6 +3,8 @@ const { runWorkerProcess } = require('../../lib/server/worker');
 
 // 仅由本地隔离验收入口启动；使用真实 pg，凭据只从隔离的子进程环境读取。
 const mode = process.env.PAINTTRACK_POSTGRES_WORKER_MODE;
+// 领取范围收窄到本段自建任务类型：共享验收库里其它夹具可能留下排队或过期任务。
+const taskType = process.env.PAINTTRACK_POSTGRES_WORKER_TASK_TYPE || undefined;
 const send = (message) => { if (process.connected) process.send(message); };
 let started = false;
 let finishTask;
@@ -24,6 +26,7 @@ process.on('message', (message) => {
         await runWorkerProcess({
             databaseUrl: process.env.PAINTTRACK_WORKER_DATABASE_URL,
             workerId: `postgres-child-${process.pid}`,
+            taskType,
             leaseSeconds: ['crash', 'cooperative', 'uncooperative'].includes(mode) ? 2 : 10,
             heartbeatIntervalMs: 200,
             pollIntervalMs: 50,

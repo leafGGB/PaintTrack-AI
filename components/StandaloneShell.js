@@ -3,13 +3,36 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import dynamic from 'next/dynamic';
-import { ImageStudio, VideoStudio, ClippingStudio, MotionControlStudio, VibeMotionStudio, LipSyncStudio, RecastStudio, CinemaStudio, AudioStudio, MarketingStudio, WorkflowStudio, AgentStudio, AppsStudio, AiInfluencerStudio, LayersStudio } from 'studio';
-
-const DesignAgentStudio = dynamic(() => import('studio').then(mod => mod.DesignAgentStudio), {
-  ssr: false,
-  loading: () => <div className="h-full w-full bg-black flex items-center justify-center text-white/20">Loading Design Studio...</div>
-});
 import { getCommonCopy, getLocaleConfig, localizeStudioPath } from '@/lib/locales';
+
+const StudioLoading = () => <div role="status" className="h-full w-full flex items-center justify-center text-cyan-300"><span aria-hidden="true" className="animate-spin">◌</span><span className="sr-only">Loading Studio</span></div>;
+// Import individual entries so opening one panel does not execute the package barrel.
+const AssetsStudio = dynamic(() => import('studio/AssetsStudio'), { ssr: false, loading: StudioLoading });
+const ImageStudio = dynamic(() => import('studio/ImageStudio'), { ssr: false, loading: StudioLoading });
+const VideoStudio = dynamic(() => import('studio/VideoStudio'), { ssr: false, loading: StudioLoading });
+const ClippingStudio = dynamic(() => import('studio/ClippingStudio'), { ssr: false, loading: StudioLoading });
+const MotionControlStudio = dynamic(() => import('studio/MotionControlStudio'), { ssr: false, loading: StudioLoading });
+const VibeMotionStudio = dynamic(() => import('studio/VibeMotionStudio'), { ssr: false, loading: StudioLoading });
+const LipSyncStudio = dynamic(() => import('studio/LipSyncStudio'), { ssr: false, loading: StudioLoading });
+const RecastStudio = dynamic(() => import('studio/RecastStudio'), { ssr: false, loading: StudioLoading });
+const CinemaStudio = dynamic(() => import('studio/CinemaStudio'), { ssr: false, loading: StudioLoading });
+const AudioStudio = dynamic(() => import('studio/AudioStudio'), { ssr: false, loading: StudioLoading });
+const MarketingStudio = dynamic(() => import('studio/MarketingStudio'), { ssr: false, loading: StudioLoading });
+const WorkflowStudio = dynamic(() => import('studio/WorkflowStudio'), { ssr: false, loading: StudioLoading });
+const AgentStudio = dynamic(() => import('studio/AgentStudio'), { ssr: false, loading: StudioLoading });
+const DesignAgentStudio = dynamic(() => import('studio/DesignAgentStudio'), { ssr: false, loading: StudioLoading });
+const AppsStudio = dynamic(() => import('studio/AppsStudio'), { ssr: false, loading: StudioLoading });
+const AiInfluencerStudio = dynamic(() => import('studio/AiInfluencerStudio'), { ssr: false, loading: StudioLoading });
+const LayersStudio = dynamic(() => import('studio/LayersStudio'), { ssr: false, loading: StudioLoading });
+
+// Preserve local edits and in-flight work after the first visit, but never
+// initialize a tool the user has not opened.
+function StudioPanel({ active, children }) {
+  const [visited, setVisited] = useState(active);
+  if (active && !visited) setVisited(true);
+  if (!active && !visited) return null;
+  return <div className={active ? 'h-full w-full' : 'hidden'}>{children}</div>;
+}
 
 // Tab/category ids, icons, and English `label` fallbacks are stable
 // identifiers, not locale copy — the actual rendered label is resolved
@@ -17,6 +40,7 @@ import { getCommonCopy, getLocaleConfig, localizeStudioPath } from '@/lib/locale
 // inside the component below, with these English strings as the fallback
 // when a locale bundle is missing the key.
 const TABS = [
+  { id: 'assets', label: 'My assets', icon: <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M3 15l6-6 5 5 3-3 4 4"/></svg> },
   {
     id: 'image',
     label: 'Image Studio',
@@ -258,7 +282,7 @@ const NAVIGATION_CATEGORIES = [
   }
 ];
 
-const EXPLORE_APPS_TAB = TABS.find((tab) => tab.id === 'apps');
+const TOP_LEVEL_TABS = ['assets', 'apps'].map((id) => TABS.find((tab) => tab.id === id));
 
 const getNavigationCategory = (tabId) => (
   NAVIGATION_CATEGORIES.find((category) => category.tabIds.includes(tabId))
@@ -269,11 +293,15 @@ const getNavigationCategory = (tabId) => (
 const NOTIFICATIONS_STORAGE_KEY = 'open_gen_notifications_v1';
 const MAX_VISIBLE_NOTIFICATIONS = 3;
 
-const loadStoredNotifications = () => {
+const notificationStorageKey = (accountId) => (
+  accountId ? `${NOTIFICATIONS_STORAGE_KEY}:${accountId}` : `${NOTIFICATIONS_STORAGE_KEY}:unscoped`
+);
+
+const loadStoredNotifications = (accountId) => {
   if (typeof window === 'undefined') return [];
 
   try {
-    const stored = JSON.parse(window.sessionStorage.getItem(NOTIFICATIONS_STORAGE_KEY) || '[]');
+    const stored = JSON.parse(window.sessionStorage.getItem(notificationStorageKey(accountId)) || '[]');
     const now = Date.now();
     return Array.isArray(stored)
       ? stored.filter((notification) => notification.expiresAt > now).slice(0, MAX_VISIBLE_NOTIFICATIONS)
@@ -283,12 +311,12 @@ const loadStoredNotifications = () => {
   }
 };
 
-const persistNotifications = (notifications) => {
+const persistNotifications = (accountId, notifications) => {
   if (typeof window === 'undefined') return;
 
   try {
     window.sessionStorage.setItem(
-      NOTIFICATIONS_STORAGE_KEY,
+      notificationStorageKey(accountId),
       JSON.stringify(notifications),
     );
   } catch {
@@ -305,8 +333,8 @@ export default function StandaloneShell({ locale = 'en' }) {
 
   const copy = getCommonCopy(locale);
   const tabLabel = useCallback(
-    (tabId) => copy.tabs?.[tabId] || TABS.find((t) => t.id === tabId)?.label || tabId,
-    [copy],
+    (tabId) => tabId === 'assets' ? (locale === 'zh' ? '资产' : 'Assets') : copy.tabs?.[tabId] || TABS.find((t) => t.id === tabId)?.label || tabId,
+    [copy, locale],
   );
   const categoryLabel = useCallback(
     (categoryId) => copy.categories?.[categoryId] || NAVIGATION_CATEGORIES.find((c) => c.id === categoryId)?.label || categoryId,
@@ -392,7 +420,8 @@ export default function StandaloneShell({ locale = 'en' }) {
 
   // Drag and Drop State
   const [isDragging, setIsDragging] = useState(false);
-  const [droppedFiles, setDroppedFiles] = useState(null);
+  const [pendingDrop, setPendingDrop] = useState(null);
+  const droppedFiles = pendingDrop?.tab === activeTab ? pendingDrop.files : null;
 
   // Global generation notifications remain mounted while users switch studios.
   const [notifications, setNotifications] = useState([]);
@@ -431,9 +460,10 @@ export default function StandaloneShell({ locale = 'en' }) {
   }, [locale]);
 
   useEffect(() => {
-    setNotifications(loadStoredNotifications());
+    if (authStatus !== 'authenticated' || !currentUser?.id) return;
+    setNotifications(loadStoredNotifications(currentUser.id));
     setNotificationsHydrated(true);
-  }, []);
+  }, [authStatus, currentUser?.id]);
 
   const pushNotification = useCallback((notif) => {
     const now = Date.now();
@@ -445,24 +475,24 @@ export default function StandaloneShell({ locale = 'en' }) {
         ...previous.filter((notification) => notification.expiresAt > now),
         entry,
       ].slice(-MAX_VISIBLE_NOTIFICATIONS);
-      persistNotifications(next);
+      persistNotifications(currentUser?.id, next);
       return next;
     });
-  }, []);
+  }, [currentUser?.id]);
 
   const dismissNotification = useCallback((id) => {
     setNotifications((previous) => {
       const next = previous.filter((notification) => notification.id !== id);
-      persistNotifications(next);
+      persistNotifications(currentUser?.id, next);
       return next;
     });
-  }, []);
+  }, [currentUser?.id]);
 
   useEffect(() => {
     if (!notificationsHydrated) return;
 
-    persistNotifications(notifications);
-  }, [notifications, notificationsHydrated]);
+    persistNotifications(currentUser?.id, notifications);
+  }, [currentUser?.id, notifications, notificationsHydrated]);
 
   useEffect(() => {
     if (notifications.length === 0) return undefined;
@@ -667,14 +697,14 @@ export default function StandaloneShell({ locale = 'en' }) {
     setIsDragging(false);
 
     const files = Array.from(e.dataTransfer.files);
-    if (files.length > 0) {
-      setDroppedFiles(files);
+    if (files.length > 0 && ['image', 'layers', 'video', 'clipping', 'motion-control', 'lipsync', 'body-swap', 'audio', 'marketing'].includes(activeTab)) {
+      setPendingDrop({ tab: activeTab, files });
     }
-  }, []);
+  }, [activeTab]);
 
   const handleFilesHandled = useCallback(() => {
-    setDroppedFiles(null);
-  }, []);
+    setPendingDrop((current) => current === pendingDrop ? null : current);
+  }, [pendingDrop]);
 
   if (!hasMounted || authStatus !== 'authenticated') return (
     <div className="min-h-screen bg-[#050505] flex items-center justify-center">
@@ -937,75 +967,77 @@ export default function StandaloneShell({ locale = 'en' }) {
                 })}
               </div>
 
-              {EXPLORE_APPS_TAB && (
-                <div className="mt-3 pt-3 border-t border-white/[0.07]">
+              <div className="mt-3 pt-3 space-y-1 border-t border-white/[0.07]">
+                {TOP_LEVEL_TABS.map((tab) => (
                   <a
-                    href={studioPath(EXPLORE_APPS_TAB.id)}
-                    onClick={(event) => handleNavigationItemClick(event, EXPLORE_APPS_TAB.id)}
-                    aria-current={activeTab === EXPLORE_APPS_TAB.id ? 'page' : undefined}
-                    aria-label={tabLabel(EXPLORE_APPS_TAB.id)}
-                    title={isSidebarCollapsed && !isMobileOpen ? tabLabel(EXPLORE_APPS_TAB.id) : undefined}
+                    key={tab.id}
+                    href={studioPath(tab.id)}
+                    onClick={(event) => handleNavigationItemClick(event, tab.id)}
+                    aria-current={activeTab === tab.id ? 'page' : undefined}
+                    aria-label={tabLabel(tab.id)}
+                    title={isSidebarCollapsed && !isMobileOpen ? tabLabel(tab.id) : undefined}
                     className={`
                       group relative flex items-center rounded-xl transition-all duration-150 text-[13px] font-semibold
                       ${isSidebarCollapsed && !isMobileOpen ? 'h-11 w-11 justify-center mx-auto' : 'px-3 py-2.5 w-full gap-3'}
-                      ${activeTab === EXPLORE_APPS_TAB.id
+                      ${activeTab === tab.id
                         ? 'bg-gradient-to-r from-[#22d3ee]/15 to-purple-500/10 text-[#22d3ee] border border-[#22d3ee]/20'
                         : 'text-white/60 hover:text-white hover:bg-white/[0.04] border border-transparent'
                       }
                     `}
                   >
-                    {activeTab === EXPLORE_APPS_TAB.id && (
+                    {activeTab === tab.id && (
                       <span className="absolute left-0 top-2 bottom-2 w-1 bg-gradient-to-b from-[#22d3ee] to-[#a855f7] rounded-r-full" />
                     )}
-                    <span className={`flex-shrink-0 ${activeTab === EXPLORE_APPS_TAB.id ? 'text-[#22d3ee]' : 'text-white/50 group-hover:text-white'}`}>
-                      {EXPLORE_APPS_TAB.icon}
+                    <span className={`flex-shrink-0 ${activeTab === tab.id ? 'text-[#22d3ee]' : 'text-white/50 group-hover:text-white'}`}>
+                      {tab.icon}
                     </span>
                     {(!isSidebarCollapsed || isMobileOpen) && (
-                      <span className="truncate">{tabLabel(EXPLORE_APPS_TAB.id)}</span>
+                      <span className="truncate">{tabLabel(tab.id)}</span>
                     )}
                   </a>
-                </div>
-              )}
+                ))}
+              </div>
             </nav>
           </aside>
         )}
 
         {/* Studio Content */}
         <div className="flex-1 min-h-0 h-full relative overflow-hidden bg-[#030303]">
-        <div className={activeTab === 'image' ? "h-full w-full" : "hidden"}>
-          <ImageStudio apiKey={apiKey} locale={locale} droppedFiles={droppedFiles} onFilesHandled={handleFilesHandled} onGenerationStart={makeGenerationStartCallback('image')} onGenerationEnd={makeGenerationEndCallback('image')} onGenerationComplete={makeSuccessCallback('image')} onGenerationError={makeErrorCallback('image')} />
-        </div>
-        <div className={activeTab === 'layers' ? "h-full w-full" : "hidden"}>
-          <LayersStudio apiKey={apiKey} locale={locale} droppedFiles={droppedFiles} onFilesHandled={handleFilesHandled} onGenerationStart={makeGenerationStartCallback('layers')} onGenerationEnd={makeGenerationEndCallback('layers')} onGenerationComplete={makeSuccessCallback('layers')} onGenerationError={makeErrorCallback('layers')} />
-        </div>
-        <div className={activeTab === 'video' ? "h-full w-full" : "hidden"}>
-          <VideoStudio apiKey={apiKey} locale={locale} droppedFiles={droppedFiles} onFilesHandled={handleFilesHandled} onGenerationStart={makeGenerationStartCallback('video')} onGenerationEnd={makeGenerationEndCallback('video')} onGenerationComplete={makeSuccessCallback('video')} onGenerationError={makeErrorCallback('video')} />
-        </div>
-        <div className={activeTab === 'clipping' ? "h-full w-full" : "hidden"}>
-          <ClippingStudio apiKey={apiKey} locale={locale} droppedFiles={droppedFiles} onFilesHandled={handleFilesHandled} onGenerationStart={makeGenerationStartCallback('clipping')} onGenerationEnd={makeGenerationEndCallback('clipping')} onGenerationComplete={makeSuccessCallback('clipping')} onGenerationError={makeErrorCallback('clipping')} />
-        </div>
-        <div className={activeTab === 'motion-control' ? "h-full w-full" : "hidden"}>
-          <MotionControlStudio apiKey={apiKey} locale={locale} droppedFiles={droppedFiles} onFilesHandled={handleFilesHandled} onGenerationStart={makeGenerationStartCallback('motion-control')} onGenerationEnd={makeGenerationEndCallback('motion-control')} onGenerationComplete={makeSuccessCallback('motion-control')} onGenerationError={makeErrorCallback('motion-control')} />
-        </div>
-        <div className={activeTab === 'vibe-motion' ? "h-full w-full" : "hidden"}>
+        {activeTab === 'assets' && <AssetsStudio key={`assets-${currentUser?.id || 'anonymous'}`} accountId={currentUser?.id || null} active locale={locale} />}
+        <StudioPanel active={activeTab === 'image'}>
+          <ImageStudio key={`image-studio-${currentUser?.id || 'anonymous'}`} apiKey={apiKey} accountId={currentUser?.id || null} locale={locale} droppedFiles={activeTab === 'image' ? droppedFiles : null} onFilesHandled={handleFilesHandled} onGenerationStart={makeGenerationStartCallback('image')} onGenerationEnd={makeGenerationEndCallback('image')} onGenerationComplete={makeSuccessCallback('image')} onGenerationError={makeErrorCallback('image')} />
+        </StudioPanel>
+        <StudioPanel active={activeTab === 'layers'}>
+          <LayersStudio apiKey={apiKey} locale={locale} droppedFiles={activeTab === 'layers' ? droppedFiles : null} onFilesHandled={handleFilesHandled} onGenerationStart={makeGenerationStartCallback('layers')} onGenerationEnd={makeGenerationEndCallback('layers')} onGenerationComplete={makeSuccessCallback('layers')} onGenerationError={makeErrorCallback('layers')} />
+        </StudioPanel>
+        <StudioPanel active={activeTab === 'video'}>
+          <VideoStudio key={`video-studio-${currentUser?.id || 'anonymous'}`} apiKey={apiKey} accountId={currentUser?.id || null} locale={locale} droppedFiles={activeTab === 'video' ? droppedFiles : null} onFilesHandled={handleFilesHandled} onGenerationStart={makeGenerationStartCallback('video')} onGenerationEnd={makeGenerationEndCallback('video')} onGenerationComplete={makeSuccessCallback('video')} onGenerationError={makeErrorCallback('video')} />
+        </StudioPanel>
+        <StudioPanel active={activeTab === 'clipping'}>
+          <ClippingStudio apiKey={apiKey} locale={locale} droppedFiles={activeTab === 'clipping' ? droppedFiles : null} onFilesHandled={handleFilesHandled} onGenerationStart={makeGenerationStartCallback('clipping')} onGenerationEnd={makeGenerationEndCallback('clipping')} onGenerationComplete={makeSuccessCallback('clipping')} onGenerationError={makeErrorCallback('clipping')} />
+        </StudioPanel>
+        <StudioPanel active={activeTab === 'motion-control'}>
+          <MotionControlStudio apiKey={apiKey} locale={locale} droppedFiles={activeTab === 'motion-control' ? droppedFiles : null} onFilesHandled={handleFilesHandled} onGenerationStart={makeGenerationStartCallback('motion-control')} onGenerationEnd={makeGenerationEndCallback('motion-control')} onGenerationComplete={makeSuccessCallback('motion-control')} onGenerationError={makeErrorCallback('motion-control')} />
+        </StudioPanel>
+        <StudioPanel active={activeTab === 'vibe-motion'}>
           <VibeMotionStudio apiKey={apiKey} locale={locale} onGenerationStart={makeGenerationStartCallback('vibe-motion')} onGenerationEnd={makeGenerationEndCallback('vibe-motion')} onGenerationComplete={makeSuccessCallback('vibe-motion')} onGenerationError={makeErrorCallback('vibe-motion')} />
-        </div>
-        <div className={activeTab === 'lipsync' ? "h-full w-full" : "hidden"}>
-          <LipSyncStudio apiKey={apiKey} locale={locale} droppedFiles={droppedFiles} onFilesHandled={handleFilesHandled} onGenerationStart={makeGenerationStartCallback('lipsync')} onGenerationEnd={makeGenerationEndCallback('lipsync')} onGenerationComplete={makeSuccessCallback('lipsync')} onGenerationError={makeErrorCallback('lipsync')} />
-        </div>
-        <div className={activeTab === 'body-swap' ? "h-full w-full" : "hidden"}>
-          <RecastStudio apiKey={apiKey} locale={locale} droppedFiles={droppedFiles} onFilesHandled={handleFilesHandled} onGenerationStart={makeGenerationStartCallback('body-swap')} onGenerationEnd={makeGenerationEndCallback('body-swap')} onGenerationComplete={makeSuccessCallback('body-swap')} onGenerationError={makeErrorCallback('body-swap')} />
-        </div>
-        <div className={activeTab === 'cinema' ? "h-full w-full" : "hidden"}>
+        </StudioPanel>
+        <StudioPanel active={activeTab === 'lipsync'}>
+          <LipSyncStudio apiKey={apiKey} locale={locale} droppedFiles={activeTab === 'lipsync' ? droppedFiles : null} onFilesHandled={handleFilesHandled} onGenerationStart={makeGenerationStartCallback('lipsync')} onGenerationEnd={makeGenerationEndCallback('lipsync')} onGenerationComplete={makeSuccessCallback('lipsync')} onGenerationError={makeErrorCallback('lipsync')} />
+        </StudioPanel>
+        <StudioPanel active={activeTab === 'body-swap'}>
+          <RecastStudio apiKey={apiKey} locale={locale} droppedFiles={activeTab === 'body-swap' ? droppedFiles : null} onFilesHandled={handleFilesHandled} onGenerationStart={makeGenerationStartCallback('body-swap')} onGenerationEnd={makeGenerationEndCallback('body-swap')} onGenerationComplete={makeSuccessCallback('body-swap')} onGenerationError={makeErrorCallback('body-swap')} />
+        </StudioPanel>
+        <StudioPanel active={activeTab === 'cinema'}>
           <CinemaStudio apiKey={apiKey} locale={locale} onGenerationStart={makeGenerationStartCallback('cinema')} onGenerationEnd={makeGenerationEndCallback('cinema')} onGenerationComplete={makeSuccessCallback('cinema')} onGenerationError={makeErrorCallback('cinema')} />
-        </div>
-        <div className={activeTab === 'audio' ? "h-full w-full" : "hidden"}>
-          <AudioStudio apiKey={apiKey} locale={locale} droppedFiles={droppedFiles} onFilesHandled={handleFilesHandled} onGenerationStart={makeGenerationStartCallback('audio')} onGenerationEnd={makeGenerationEndCallback('audio')} onGenerationComplete={makeSuccessCallback('audio')} onGenerationError={makeErrorCallback('audio')} />
-        </div>
-        <div className={activeTab === 'marketing' ? "h-full w-full" : "hidden"}>
-          <MarketingStudio apiKey={apiKey} locale={locale} droppedFiles={droppedFiles} onFilesHandled={handleFilesHandled} onGenerationStart={makeGenerationStartCallback('marketing')} onGenerationEnd={makeGenerationEndCallback('marketing')} onGenerationComplete={makeSuccessCallback('marketing')} onGenerationError={makeErrorCallback('marketing')} />
-        </div>
-        <div className={activeTab === 'workflows' ? "h-full w-full" : "hidden"}>
+        </StudioPanel>
+        <StudioPanel active={activeTab === 'audio'}>
+          <AudioStudio apiKey={apiKey} locale={locale} droppedFiles={activeTab === 'audio' ? droppedFiles : null} onFilesHandled={handleFilesHandled} onGenerationStart={makeGenerationStartCallback('audio')} onGenerationEnd={makeGenerationEndCallback('audio')} onGenerationComplete={makeSuccessCallback('audio')} onGenerationError={makeErrorCallback('audio')} />
+        </StudioPanel>
+        <StudioPanel active={activeTab === 'marketing'}>
+          <MarketingStudio apiKey={apiKey} locale={locale} droppedFiles={activeTab === 'marketing' ? droppedFiles : null} onFilesHandled={handleFilesHandled} onGenerationStart={makeGenerationStartCallback('marketing')} onGenerationEnd={makeGenerationEndCallback('marketing')} onGenerationComplete={makeSuccessCallback('marketing')} onGenerationError={makeErrorCallback('marketing')} />
+        </StudioPanel>
+        <StudioPanel active={activeTab === 'workflows'}>
           <WorkflowStudio
             apiKey={apiKey}
             isHeaderVisible={isHeaderVisible}
@@ -1015,10 +1047,10 @@ export default function StandaloneShell({ locale = 'en' }) {
             onGenerationComplete={makeSuccessCallback('workflows')}
             onGenerationError={makeErrorCallback('workflows')}
           />
-        </div>
-        <div className={activeTab === 'agents' ? "h-full w-full" : "hidden"}>
+        </StudioPanel>
+        <StudioPanel active={activeTab === 'agents'}>
           <AgentStudio apiKey={apiKey} locale={locale} isHeaderVisible={isHeaderVisible} onToggleHeader={setIsHeaderVisible} />
-        </div>
+        </StudioPanel>
         <div className={activeTab === 'design-agent' ? "h-full w-full" : "hidden"}>
           {activeTab === 'design-agent' && (
             <DesignAgentStudio
@@ -1032,10 +1064,10 @@ export default function StandaloneShell({ locale = 'en' }) {
             />
           )}
         </div>
-        <div className={activeTab === 'apps' ? "h-full w-full" : "hidden"}>
+        <StudioPanel active={activeTab === 'apps'}>
           <AppsStudio apiKey={apiKey} locale={locale} />
-        </div>
-        <div className={activeTab === 'ai-influencer' ? "h-full w-full" : "hidden"}>
+        </StudioPanel>
+        <StudioPanel active={activeTab === 'ai-influencer'}>
           <AiInfluencerStudio
             apiKey={apiKey}
             locale={locale}
@@ -1044,7 +1076,7 @@ export default function StandaloneShell({ locale = 'en' }) {
             onGenerationComplete={makeSuccessCallback('ai-influencer')}
             onGenerationError={makeErrorCallback('ai-influencer')}
           />
-        </div>
+        </StudioPanel>
       </div>
     </div>
 

@@ -75,16 +75,17 @@ const DEFAULT_LOCAL_DATABASE = 'pt_local_auth_000000000000';
 const LOCAL_DATABASE_PATTERN = /^pt_local_auth_[a-z0-9_]{1,24}$/;
 
 // 复用模式下库名固定，账号与会话因此跨重启保留；--fresh 仍生成一次性随机库。
-function localDatabasePlan({ environment = process.env, fresh = false, randomSuffix } = {}) {
+function localDatabasePlan({ environment = process.env, fresh = false, randomSuffix, controlledImage = false } = {}) {
     const suffix = randomSuffix || crypto.randomBytes(6).toString('hex');
-    if (fresh) {
+    if (fresh || controlledImage) {
+        const slug = controlledImage ? `ci_${suffix}` : suffix;
         return {
-            database: `pt_local_auth_${suffix}`,
-            migrationRole: `pt_local_migrate_${suffix}`,
-            runtimeRole: `pt_local_runtime_${suffix}`,
-            workerRole: `pt_local_worker_${suffix}`,
-            cleanupRole: `pt_local_cleanup_${suffix}`,
-            slug: suffix,
+            database: `pt_local_auth_${slug}`,
+            migrationRole: `pt_local_migrate_${slug}`,
+            runtimeRole: `pt_local_runtime_${slug}`,
+            workerRole: `pt_local_worker_${slug}`,
+            cleanupRole: `pt_local_cleanup_${slug}`,
+            slug,
             distSuffix: suffix,
             reuse: false,
         };
@@ -92,7 +93,7 @@ function localDatabasePlan({ environment = process.env, fresh = false, randomSuf
     const configured = typeof environment.PAINTTRACK_LOCAL_DATABASE === 'string'
         ? environment.PAINTTRACK_LOCAL_DATABASE.trim() : '';
     const database = configured || DEFAULT_LOCAL_DATABASE;
-    if (!LOCAL_DATABASE_PATTERN.test(database)) throw new Error('LOCAL_DATABASE_NAME_INVALID');
+    if (!LOCAL_DATABASE_PATTERN.test(database) || database.startsWith('pt_local_auth_ci_')) throw new Error('LOCAL_DATABASE_NAME_INVALID');
     const slug = database.slice('pt_local_auth_'.length);
     return {
         database,
@@ -120,14 +121,20 @@ function localRolesFromOwner(ownerRole) {
     };
 }
 
-function createNextEnvironment({ runtimeUrl, internalPort, origin, secret, mfaEncryptionKey, suffix, heapMb, mockRouting = false, authorizationFixtures = false, fixtureEmail = '', assetStorageRoot = null }, source = process.env) {
+function controlledImageEnvironment(ownerId) {
+    return { PAINTTRACK_LOCAL_CONTROLLED_IMAGE: '1', PAINTTRACK_CONTROLLED_IMAGE_OWNER: ownerId, PAINTTRACK_LOCAL_INTERNAL_GUARD: '1' };
+}
+
+function createNextEnvironment({ runtimeUrl, internalPort, origin, secret, mfaEncryptionKey, suffix, heapMb, mockRouting = false, chargedSubmission = false, authorizationFixtures = false, fixtureEmail = '', assetStorageRoot = null, controlledOwnerId }, source = process.env) {
     const preloadPath = path.join(__dirname, 'local-next-env-preload.cjs').replace(/\\/g, '/');
     const storageRoot = localAssetStorageRoot(assetStorageRoot);
     return {
         ...copySystemEnvironment(source),
         ...(storageRoot ? { PAINTTRACK_ASSET_STORAGE_ROOT: storageRoot } : {}),
         NODE_ENV: 'development', DATABASE_URL: runtimeUrl, PORT: String(internalPort),
+        ...(controlledOwnerId ? controlledImageEnvironment(controlledOwnerId) : {}),
         ...(mockRouting ? { PAINTTRACK_LOCAL_MOCK_ROUTING: '1' } : {}),
+        ...(chargedSubmission ? { PAINTTRACK_CHARGED_SUBMISSION: '1' } : {}),
         APP_BASE_URL: origin, AUTH_ALLOW_LOCAL_HTTP: '1', PAINTTRACK_LOCAL_MAILBOX: '1',
         ...(authorizationFixtures ? { PAINTTRACK_DEV_ADMIN_FIXTURE_EMAIL: fixtureEmail } : {}),
         PAINTTRACK_LOCAL_MAILBOX_SECRET: secret,
@@ -169,6 +176,26 @@ function createCleanupEnvironment(cleanupUrl, source = process.env, { assetStora
     };
 }
 
+// 结算宿主只拿到独立账务连接与目标确认，不把账务连接传给 Next/Worker。
+function createSettlementEnvironment(ledgerUrl, targetUrl, source = process.env) {
+    if (typeof ledgerUrl !== 'string' || !ledgerUrl) throw new TypeError('ledgerUrl is required');
+    if (typeof targetUrl !== 'string' || !targetUrl) throw new TypeError('targetUrl is required');
+    return {
+        ...copySystemEnvironment(source),
+        NODE_ENV: 'development',
+        LEDGER_DATABASE_URL: ledgerUrl,
+        DATABASE_URL: targetUrl,
+        PAINTTRACK_SETTLEMENT_INTERVAL_MS: source.PAINTTRACK_SETTLEMENT_INTERVAL_MS || '30000',
+        PAINTTRACK_SETTLEMENT_LIMIT: source.PAINTTRACK_SETTLEMENT_LIMIT || '50',
+    };
+}
+
+function databaseUrlForTarget(adminUrl, database) {
+    const url = new URL(adminUrl);
+    url.pathname = `/${database}`;
+    return url.href;
+}
+
 function localAdminUrl(value) {
     if (typeof value !== 'string' || !value.trim()) throw new Error('LOCAL_DATABASE_ADMIN_URL_REQUIRED');
     try {
@@ -185,11 +212,17 @@ function localAdminUrl(value) {
 }
 
 function localRoleUrl(adminUrl, role, password, database) {
+    if (role.startsWith('pt_ledger_owner_')) throw new Error('LEDGER_OWNER_RUNTIME_IDENTITY_FORBIDDEN');
     const url = new URL(localAdminUrl(adminUrl));
     url.username = role;
     url.password = password;
     url.pathname = `/${database}`;
     return url.href;
+}
+
+async function grantLocalSnapshotInsert(owner, runtimeRole) {
+    if (!/^pt_local_runtime_[a-z0-9_]{1,24}$/.test(runtimeRole)) throw new Error('INVALID_LOCAL_ROUTE_ROLE');
+    await owner.query(`GRANT INSERT(logical_model_pk,route_snapshot,route_snapshot_version,route_snapshot_hash) ON generation_tasks TO "${runtimeRole}"`);
 }
 
 async function prepareLocalMockRouting(owner, runtimeRole) {
@@ -201,12 +234,52 @@ async function prepareLocalMockRouting(owner, runtimeRole) {
             VALUES ($1::uuid, $2, $3, $4, $5::jsonb, false) ON CONFLICT (id) DO NOTHING`,
         [model.id, model.logicalModelId, `Synthetic ${model.mediaType} fixture`, model.mediaType, JSON.stringify([model.operation])]);
     }
-    // 只为本次新建的本地角色补充快照 INSERT；不授予快照 UPDATE 或配置表写权限。
-    await owner.query(`GRANT INSERT(logical_model_pk,route_snapshot,route_snapshot_version,route_snapshot_hash) ON generation_tasks TO "${runtimeRole}"`);
+    await grantLocalSnapshotInsert(owner, runtimeRole);
+}
+
+async function prepareControlledImage(owner, runtimeRole, fixture) {
+    const { logicalModelId, modelPk, publicModel } = require('../lib/server/tasks/controlledImageDevelopment');
+    const { hashPassword } = require('../lib/server/registration');
+    const hash = await hashPassword(fixture.password);
+    delete fixture.password;
+    await owner.query('BEGIN');
+    try {
+        await owner.query("INSERT INTO users (id,email,password_hash,email_verified_at) VALUES ($1,$2,$3,now())", [fixture.ownerId, fixture.fixtureEmail, hash]);
+        await owner.query(`INSERT INTO logical_models (id,logical_model_id,display_name,media_type,supported_operations,enabled)
+            VALUES ($1,$2,$3,'image','["image.generate"]'::jsonb,false)`, [modelPk, logicalModelId, publicModel.displayName]);
+        await grantLocalSnapshotInsert(owner, runtimeRole);
+        await owner.query('COMMIT');
+    } catch (error) {
+        await owner.query('ROLLBACK');
+        throw error;
+    }
+}
+
+function localExecutionOptions(args = [], environment = {}) {
+    return {
+        mockRouting: args.includes('--mock') || environment.PAINTTRACK_LOCAL_MOCK_ROUTING === '1',
+        localWorker: args.includes('--worker') || environment.PAINTTRACK_LOCAL_WORKER === '1',
+    };
+}
+
+function controlledImageLaunch(args, environment) {
+    const requested = args.includes('--controlled-image');
+    if (environment.PAINTTRACK_LOCAL_CONTROLLED_IMAGE !== undefined) throw new Error('CONTROLLED_IMAGE_LAUNCHER_REQUIRED');
+    if (!requested) return null;
+    const { conflictingEnvironment, fixtureEmail } = require('../lib/server/tasks/controlledImageDevelopment');
+    if (args.length !== 1 || conflictingEnvironment(environment)
+        || ['PAINTTRACK_LOCAL_DATABASE', 'PAINTTRACK_ASSET_STORAGE_ROOT'].some(key => environment[key])) {
+        throw new Error('CONTROLLED_IMAGE_MODE_CONFLICT');
+    }
+    const { validateInput } = require('../lib/server/registration');
+    const { password } = validateInput('register', { email: fixtureEmail, password: environment.PAINTTRACK_CONTROLLED_IMAGE_PASSWORD });
+    return { ownerId: crypto.randomUUID(), password, fixtureEmail };
 }
 
 async function provision() {
     if (process.env.NODE_ENV === 'production') throw new Error('Development only');
+    const controlledImage = controlledImageLaunch(process.argv.slice(2), process.env);
+    const { mockRouting, localWorker } = localExecutionOptions(process.argv.slice(2), process.env);
     // `--prune` 是维护入口：只清理 `.next_local_*` 与历史本地库，不启动任何服务，
     // 因此也不做 Next 环境文件检查。默认 dry-run，加 `--yes` 才真删。
     if (process.argv.includes('--prune')) {
@@ -234,13 +307,13 @@ async function provision() {
     const adminUrl = localAdminUrl(process.env.LOCAL_DATABASE_ADMIN_URL);
     assertNoNextEnvironmentFiles(root);
     const { Client } = require('pg');
-    const { migrateDatabase } = require('../lib/server/db/migrate');
+    const { migrateDatabase, ledgerOwnerRole } = require('../lib/server/db/migrate');
     // 默认复用同一个本地库：账号、登录会话、任务与资产跨重启保留。
     // 需要干净环境时加 --fresh，退回一次性随机库的原行为。
-    const fresh = process.argv.includes('--fresh');
+    const fresh = Boolean(controlledImage) || process.argv.includes('--fresh');
     let plan;
     try {
-        plan = localDatabasePlan({ fresh });
+        plan = localDatabasePlan({ fresh, controlledImage: Boolean(controlledImage) });
     } catch (error) {
         // 只回显固定错误码，不回显用户输入，便于排障又不泄露值。
         if (/^[A-Z_]{4,64}$/.test(error.message)) console.error(error.message);
@@ -251,9 +324,12 @@ async function provision() {
     const suffix = plan.distSuffix;
     const authorizationFixtures = process.argv.includes('--authorization-fixtures');
     // 本地默认私有资产目录：与 Web/Worker 共用，避免用户漏配变量导致"任务成功但无图"。
-    const assetStorageRoot = localAssetStorageRoot(process.env.PAINTTRACK_ASSET_STORAGE_ROOT)
-        || path.join(root, '.local-assets');
-    fs.mkdirSync(assetStorageRoot, { recursive: true, mode: 0o700 });
+    const ordinaryStorage = path.join(root, '.local-assets');
+    const assetStorageRoot = controlledImage
+        ? path.join(ordinaryStorage, `controlled-${suffix}`)
+        : localAssetStorageRoot(process.env.PAINTTRACK_ASSET_STORAGE_ROOT) || ordinaryStorage;
+    fs.mkdirSync(controlledImage ? ordinaryStorage : assetStorageRoot, { recursive: true, mode: 0o700 });
+    if (controlledImage) fs.mkdirSync(assetStorageRoot, { mode: 0o700 });
     const port = Number(process.env.PORT || 3000);
     const internalPort = Number(process.env.PAINTTRACK_NEXT_PORT || port + 1);
     const heapMb = Number(process.env.PAINTTRACK_DEV_HEAP_MB) || 3072;
@@ -311,6 +387,7 @@ async function provision() {
             'SELECT rolname FROM pg_roles WHERE rolname = ANY($1::text[])',
             [[migrationRole, runtimeRole, workerRole, cleanupRole]],
         )).rows.map((row) => row.rolname));
+        if (controlledImage && (existing || known.size)) throw new Error('CONTROLLED_IMAGE_FRESH_TARGET_REQUIRED');
         for (const [role, password] of [
             [migrationRole, passwords.migration],
             [runtimeRole, passwords.runtime],
@@ -335,7 +412,12 @@ async function provision() {
         console.log(`Retained development database: ${database}`);
     } finally { await admin.end(); }
 
-    await migrateDatabase({ databaseUrl: runtimeUrl, migrationDatabaseUrl: migrationUrl });
+    try {
+        await migrateDatabase({ databaseUrl: runtimeUrl, migrationDatabaseUrl: migrationUrl, localDatabaseAdminUrl: adminUrl });
+    } catch (error) {
+        if (controlledImage) console.error('CONTROLLED_IMAGE_DATABASE_MIGRATION_FAILED');
+        throw error;
+    }
     const owner = new Client({ connectionString: migrationUrl });
     try {
         await owner.connect();
@@ -343,14 +425,32 @@ async function provision() {
         await owner.query(`GRANT CONNECT ON DATABASE ${database} TO ${runtimeRole}, ${workerRole}, ${cleanupRole}`);
         await owner.query(`GRANT USAGE ON SCHEMA public TO ${runtimeRole}, ${workerRole}, ${cleanupRole}`);
         const permissions = require('../lib/server/db/runtimePermissions');
-        if (process.env.PAINTTRACK_LOCAL_MOCK_ROUTING === '1') {
+        if (mockRouting) {
             await prepareLocalMockRouting(owner, runtimeRole);
             // 固定FK身份仅供合成路由，公共目录保持禁用，不冒充正式动态目录。
         }
+        if (controlledImage) await prepareControlledImage(owner, runtimeRole, controlledImage);
         await permissions.grantWebRuntimePermissions(owner, runtimeRole);
+        const projectionAdmin = new Client({ connectionString: databaseUrlForTarget(adminUrl, database), connectionTimeoutMillis: 3000 });
+        try {
+            await projectionAdmin.connect();
+            await permissions.grantAdminModelsProjectionPermission(projectionAdmin, runtimeRole);
+        } finally { await projectionAdmin.end(); }
+        // 收费入口默认关闭；只有显式开启时才追加账务函数的执行权。
+        // 函数属主是 NOLOGIN 的账本 owner，执行权必须由能切换为该 owner 的管理员身份追加。
+        if (process.env.PAINTTRACK_CHARGED_SUBMISSION === '1') {
+            const ledgerAdmin = new Client({ connectionString: adminUrl });
+            try {
+                await ledgerAdmin.connect();
+                await permissions.grantChargedSubmissionPermissions(ledgerAdmin, runtimeRole, ledgerOwnerRole(database));
+            } finally { await ledgerAdmin.end(); }
+        }
         await permissions.grantWorkerRuntimePermissions(owner, workerRole);
         // 清理角色每次启动都重放授权：复用库时角色已存在，权限需要与当前代码一致。
         await permissions.grantCleanupRuntimePermissions(owner, cleanupRole);
+    } catch (error) {
+        if (controlledImage) console.error('CONTROLLED_IMAGE_DATABASE_SETUP_FAILED');
+        throw error;
     } finally { await owner.end(); }
 
     // 复用库时 fixture 邮箱按库名固定，之前注册过的管理员身份重启后仍能被提升。
@@ -390,16 +490,25 @@ async function provision() {
     const origin = `http://127.0.0.1:${port}`;
     const nextEnv = createNextEnvironment({
         runtimeUrl, internalPort, origin, secret, mfaEncryptionKey, suffix, heapMb,
-        authorizationFixtures, fixtureEmail, assetStorageRoot, mockRouting: process.env.PAINTTRACK_LOCAL_MOCK_ROUTING === '1',
+        authorizationFixtures, fixtureEmail, assetStorageRoot,
+        mockRouting, controlledOwnerId: controlledImage?.ownerId,
+        chargedSubmission: process.env.PAINTTRACK_CHARGED_SUBMISSION === '1',
     });
 
     assertNoNextEnvironmentFiles(root);
+    console.log(`LOCAL_MODEL_SOURCE=${controlledImage ? 'controlled-synthetic-image' : mockRouting ? 'mock' : 'database'}`);
+    console.log(`LOCAL_WORKER=${localWorker || controlledImage ? 'enabled' : 'disabled'}`);
     const nextProcess = spawn(process.execPath, [path.join(root, 'node_modules/next/dist/bin/next'), 'dev', '--hostname', '127.0.0.1', '--port', String(internalPort)], {
         cwd: root, env: nextEnv, stdio: ['ignore', 'inherit', 'inherit'],
     });
-    const workerProcess = process.env.PAINTTRACK_LOCAL_WORKER === '1'
+    const controlledWorker = controlledImage ? spawn(process.execPath, [path.join(root, 'scripts/local-controlled-image-worker.js')], {
+        cwd: root, stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
+        env: { ...copySystemEnvironment(process.env), NODE_ENV: 'development', ...controlledImageEnvironment(controlledImage.ownerId),
+            PAINTTRACK_WORKER_DATABASE_URL: workerUrl, PAINTTRACK_ASSET_STORAGE_ROOT: assetStorageRoot },
+    }) : null;
+    const workerProcess = localWorker
         ? spawn(process.execPath, [path.join(root, 'lib/server/worker/index.js')], {
-            cwd: root, env: createWorkerEnvironment(workerUrl, process.env, { mockRouting: process.env.PAINTTRACK_LOCAL_MOCK_ROUTING === '1', assetStorageRoot }), stdio: ['ignore', 'inherit', 'inherit'],
+            cwd: root, env: createWorkerEnvironment(workerUrl, process.env, { mockRouting, assetStorageRoot }), stdio: ['ignore', 'inherit', 'inherit'],
         })
         : null;
     // 资产清理默认不常驻：需要验证「删除后对象真的消失」时显式打开。
@@ -415,8 +524,28 @@ async function provision() {
             '--orphan-hours', process.env.PAINTTRACK_LOCAL_ASSET_CLEANUP_ORPHAN_HOURS || '6',
         ], { cwd: root, env: createCleanupEnvironment(cleanupUrl, process.env, { assetStorageRoot }), stdio: ['ignore', 'inherit', 'inherit'] })
         : null;
+    // 结算是独立受限宿主：只有显式开关打开时才把管理员账务连接交给它。
+    // 它不继承 Worker 环境，也不改变收费提交开关。
+    const settlementProcess = process.env.PAINTTRACK_LOCAL_SETTLEMENT === '1'
+        ? spawn(process.execPath, [path.join(root, 'scripts/settlement-host.js')], {
+            cwd: root,
+            env: createSettlementEnvironment(databaseUrlForTarget(adminUrl, database), runtimeUrl, process.env),
+            stdio: ['ignore', 'inherit', 'inherit'],
+        })
+        : null;
     let stopping = false;
     let nextReady = false;
+    let workerReady = false;
+    controlledWorker?.on('message', message => {
+        if (!stopping && message === 'controlled-image-ready') workerReady = true;
+    });
+    const setProxyCapability = (req) => {
+        delete req.headers['x-painttrack-controlled-image-ready'];
+        req.headers['x-painttrack-local-capability'] = secret;
+        if (controlledImage && nextReady && workerReady && controlledWorker.connected && !stopping) {
+            req.headers['x-painttrack-controlled-image-ready'] = secret;
+        }
+    };
     const server = http.createServer((req, res) => {
         if (!validRequest(req, port)) {
             res.writeHead(403, { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' });
@@ -426,7 +555,7 @@ async function provision() {
         delete req.headers['x-painttrack-local-capability'];
         delete req.headers['x-forwarded-host'];
         delete req.headers['x-forwarded-for'];
-        req.headers['x-painttrack-local-capability'] = secret;
+        setProxyCapability(req);
         req.headers.host = `127.0.0.1:${port}`;
         req.headers['x-forwarded-host'] = `127.0.0.1:${port}`;
         const upstream = http.request({ hostname: '127.0.0.1', port: internalPort, method: req.method, path: req.url, headers: req.headers }, (response) => {
@@ -444,7 +573,7 @@ async function provision() {
         delete req.headers['x-painttrack-local-capability'];
         delete req.headers['x-forwarded-host'];
         delete req.headers['x-forwarded-for'];
-        req.headers['x-painttrack-local-capability'] = secret;
+        setProxyCapability(req);
         req.headers.host = `127.0.0.1:${port}`;
         req.headers['x-forwarded-host'] = `127.0.0.1:${port}`;
         const upstream = net.connect(internalPort, '127.0.0.1', () => {
@@ -461,29 +590,64 @@ async function provision() {
         socket.on('error', () => upstream.destroy());
     });
 
+    let checkingReady = false;
     const readyPoll = setInterval(async () => {
-        if (nextReady) return;
+        if (stopping || nextReady || checkingReady || (controlledImage && !workerReady)) return;
+        checkingReady = true;
         try {
-            const response = await fetch(`http://127.0.0.1:${internalPort}/_next/static/development/_buildManifest.js`, { signal: AbortSignal.timeout(1000) });
-            if (response.status < 500) {
+            const readyPath = controlledImage ? '/api/health/database' : '/_next/static/development/_buildManifest.js';
+            const response = await fetch(`http://127.0.0.1:${internalPort}${readyPath}`, {
+                headers: controlledImage ? { 'x-painttrack-local-capability': secret } : {}, signal: AbortSignal.timeout(1000),
+            });
+            const ready = controlledImage ? response.status === 200 && (await response.json()).database === 'ok' : response.status < 500;
+            if (ready && !stopping && (!controlledImage || controlledWorker.connected)) {
                 nextReady = true;
                 clearInterval(readyPoll);
+                clearTimeout(startupDeadline);
                 console.log(`LOCAL_ASSET_STORAGE_ROOT ${assetStorageRoot}`);
                 // 只输出路径与来源，绝不输出密钥本身。
                 console.log(mfaKey.source === 'ephemeral'
                     ? 'LOCAL_MFA_KEY_EPHEMERAL (--fresh: throwaway database, throwaway key)'
                     : `LOCAL_MFA_KEY_PERSISTED ${mfaKeyPath(localStateDir)} (${mfaKey.source})`);
                 if (cleanupProcess) console.log('LOCAL_ASSET_CLEANUP_ENABLED (deleted assets are purged by a separate role)');
+                if (settlementProcess) console.log('LOCAL_SETTLEMENT_ENABLED (ledger host runs independently from Worker)');
                 console.log(`LOCAL_REGISTRATION_READY ${origin}/register`);
+                if (controlledImage) console.log(`CONTROLLED_IMAGE_READY ${origin}/login (fixture email: ${controlledImage.fixtureEmail})`);
             }
-        } catch { /* Next is still starting. */ }
+        } catch { /* Next 尚未就绪。 */ }
+        finally { checkingReady = false; }
     }, 500);
+    const startupDeadline = controlledImage ? setTimeout(() => failControlledImage('CONTROLLED_IMAGE_STARTUP_TIMEOUT'), 120000) : null;
+    const upgradedSockets = new Set();
+    server.on('upgrade', (_req, socket) => {
+        upgradedSockets.add(socket);
+        socket.once('close', () => upgradedSockets.delete(socket));
+    });
     const stopChildren = (signal) => {
+        if (controlledWorker && controlledWorker.exitCode === null && controlledWorker.signalCode === null) {
+            if (controlledWorker.connected) controlledWorker.send('controlled-image-stop', () => {});
+            const deadline = setTimeout(() => controlledWorker.kill('SIGKILL'), 8000);
+            controlledWorker.once('exit', () => clearTimeout(deadline));
+        }
         if (nextProcess.exitCode === null && nextProcess.signalCode === null) nextProcess.kill(signal);
         if (workerProcess && workerProcess.exitCode === null && workerProcess.signalCode === null) workerProcess.kill(signal);
         if (cleanupProcess && cleanupProcess.exitCode === null && cleanupProcess.signalCode === null) cleanupProcess.kill(signal);
+        if (settlementProcess && settlementProcess.exitCode === null && settlementProcess.signalCode === null) settlementProcess.kill(signal);
     };
+    function failControlledImage(code) {
+        if (stopping) return;
+        process.exitCode = 1;
+        console.error(code);
+        stop();
+    }
+    if (controlledWorker) {
+        controlledWorker.once('error', () => failControlledImage('CONTROLLED_IMAGE_WORKER_FAILED'));
+        controlledWorker.once('disconnect', () => failControlledImage('CONTROLLED_IMAGE_WORKER_DISCONNECTED'));
+        controlledWorker.once('exit', () => failControlledImage('CONTROLLED_IMAGE_WORKER_EXITED'));
+        nextProcess.once('error', () => failControlledImage('CONTROLLED_IMAGE_NEXT_FAILED'));
+    }
     nextProcess.once('exit', (code) => {
+        if (controlledImage) { failControlledImage('CONTROLLED_IMAGE_NEXT_EXITED'); return; }
         clearInterval(fixtureTimer);
         clearInterval(readyPoll);
         if (!stopping) {
@@ -509,27 +673,39 @@ async function provision() {
     cleanupProcess?.once('exit', (code) => {
         if (code && !stopping) console.error(`LOCAL_ASSET_CLEANUP_EXITED ${code} (deleted assets keep their objects until the next run)`);
     });
+    settlementProcess?.once('exit', (code) => {
+        if (code && !stopping) {
+            console.error(`LOCAL_SETTLEMENT_EXITED ${code} (unknown settlement errors require operator review)`);
+            stopping = true;
+            clearInterval(fixtureTimer);
+            clearInterval(readyPoll);
+            server.close();
+            server.closeAllConnections();
+            stopChildren('SIGTERM');
+            process.exitCode = code;
+        }
+    });
 
-    try {
-        await listen(server, port, '127.0.0.1');
-        console.log(`LOCAL_ENTRY_BOUND http://127.0.0.1:${port}`);
-    } catch (error) {
-        clearInterval(fixtureTimer);
-        clearInterval(readyPoll);
-        nextProcess.kill('SIGTERM');
-        workerProcess?.kill('SIGTERM');
-        throw error;
-    }
-    const stop = () => {
+    function stop() {
         if (stopping) return;
         stopping = true;
         clearInterval(fixtureTimer);
         clearInterval(readyPoll);
+        clearTimeout(startupDeadline);
         server.close();
         server.closeAllConnections();
+        for (const socket of upgradedSockets) socket.destroy();
         stopChildren('SIGTERM');
-    };
+    }
     for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, stop);
+    try {
+        await listen(server, port, '127.0.0.1');
+        if (stopping) server.close();
+        else console.log(`LOCAL_ENTRY_BOUND http://127.0.0.1:${port}`);
+    } catch (error) {
+        stop();
+        throw error;
+    }
 }
 
 if (require.main === module) {
@@ -539,4 +715,4 @@ if (require.main === module) {
     });
 }
 
-module.exports = { DEFAULT_LOCAL_DATABASE, assertNoNextEnvironmentFiles, copySystemEnvironment, createCleanupEnvironment, createLocalSecrets, createNextEnvironment, createWorkerEnvironment, localAdminUrl, localAssetStorageRoot, localDatabasePlan, localRoleUrl, localRolesFromOwner, prepareLocalMockRouting, validRequest };
+module.exports = { DEFAULT_LOCAL_DATABASE, assertNoNextEnvironmentFiles, copySystemEnvironment, createCleanupEnvironment, createLocalSecrets, createNextEnvironment, createSettlementEnvironment, createWorkerEnvironment, databaseUrlForTarget, localAdminUrl, localAssetStorageRoot, localDatabasePlan, localExecutionOptions, controlledImageLaunch, localRoleUrl, localRolesFromOwner, prepareLocalMockRouting, validRequest };

@@ -93,6 +93,34 @@ test('worker processes and completes a claimed task', async () => {
     assert.deepEqual(pool.calls.map((call) => call.type), ['claim', 'complete']);
 });
 
+test('worker narrows the claim to an explicit task type only when configured', async () => {
+    const scoped = createPool();
+    await withQueueStubs(scoped, async () => {
+        const worker = createWorker({
+            pool: scoped,
+            workerId: 'worker-a',
+            taskType: ' postgres-worker-acceptance ',
+            processTask: async () => {},
+        });
+        assert.deepEqual(await worker.runOnce(), { status: 'succeeded', taskId: task.id });
+    });
+    assert.deepEqual(scoped.calls[0].options, {
+        workerId: 'worker-a', leaseSeconds: 60, taskType: 'postgres-worker-acceptance',
+    });
+
+    const unscoped = createPool();
+    await withQueueStubs(unscoped, async () => {
+        const worker = createWorker({ pool: unscoped, workerId: 'worker-a', processTask: async () => {} });
+        assert.deepEqual(await worker.runOnce(), { status: 'succeeded', taskId: task.id });
+    });
+    assert.deepEqual(unscoped.calls[0].options, { workerId: 'worker-a', leaseSeconds: 60 });
+
+    assert.throws(
+        () => createWorker({ pool: {}, workerId: 'worker-a', taskType: '   ', processTask: async () => {} }),
+        /taskType must be a non-empty string/,
+    );
+});
+
 test('worker renews the lease while a task is processing', async () => {
     const pool = createPool();
     await withQueueStubs(pool, async () => {

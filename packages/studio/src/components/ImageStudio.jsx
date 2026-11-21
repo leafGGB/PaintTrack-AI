@@ -2,10 +2,12 @@
 
 import { useState, useEffect, useRef, useCallback } from "react";
 import toast, { Toaster } from "react-hot-toast";
-import { generateImage, generateI2I, uploadFile } from "../muapi.js";
-import { createImageTask, getImageTaskModel, waitForImageTask, deleteAsset, assetIdFromResultUrl } from "../taskClient.js";
+import { uploadFile } from "../muapi.js";
+import { createImageTask, getImageTaskCatalog, waitForImageTask, deleteAsset, assetIdFromResultUrl, IMAGE_TASK_ASPECT_RATIOS } from "../taskClient.js";
 import { formatErrorMessage } from "../utils/formatError.js";
-import { scopedPersistKey, migrateLegacyPersistKey } from "../persistKey.js";
+import { scopedPersistKey } from "../persistKey.js";
+import useStudioHistory from "../useStudioHistory.js";
+import { invalidateAssets } from '../assetInvalidations.js';
 import DrawModal from "./DrawModal.jsx";
 import ConfirmDialog from "./ui/ConfirmDialog.jsx";
 import ModelParameterControls from "./ModelParameterControls.jsx";
@@ -966,10 +968,33 @@ function SimpleDropdown({ title, options, selected, onSelect, onClose }) {
   );
 }
 
+function CatalogModelSelect({ models, selectedModelId, onSelect, disabled, copy }) {
+  return (
+    <label className="flex min-w-0 items-center gap-2">
+      <span className="sr-only">{copy.popovers.model}</span>
+      <select
+        aria-label={copy.popovers.model}
+        value={selectedModelId || ""}
+        disabled={disabled || models.length === 0}
+        onChange={(event) => onSelect(event.target.value)}
+        className="max-w-[220px] min-w-0 bg-transparent text-xs font-bold text-white outline-none disabled:cursor-not-allowed disabled:opacity-50"
+      >
+        {models.length === 0 ? <option value="">{copy.modelDropdown.noModelsFound}</option> : null}
+        {models.map((model) => (
+          <option key={model.logicalModelId} value={model.logicalModelId}>
+            {model.displayName} ({model.logicalModelId})
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
 // ─── Main Component ───────────────────────────────────────────────────────────
 
 export default function ImageStudio({
   apiKey,
+  accountId = null,
   taskModelId = null,
   onGenerationStart,
   onGenerationEnd,
@@ -983,15 +1008,14 @@ export default function ImageStudio({
 }) {
   const copy = resolveCopy(en, zh, locale);
   const LEGACY_PERSIST_KEY = "hg_image_studio_persistent";
-  const PERSIST_KEY = scopedPersistKey(LEGACY_PERSIST_KEY, apiKey);
-  useEffect(() => {
-    migrateLegacyPersistKey(LEGACY_PERSIST_KEY, PERSIST_KEY);
-  }, [PERSIST_KEY]);
+  const persistIdentity = accountId || apiKey || null;
+  const PERSIST_KEY = scopedPersistKey(LEGACY_PERSIST_KEY, persistIdentity);
 
   // ── Model state ─────────────────────────────────────────────────────────
   const initialFamily = imageModelCatalog.familyByVariantId.get(t2iModels[0].id);
-  const [imageMode, setImageMode] = useState(false); // false=t2i, true=i2i
-  const [selectedModelId, setSelectedModelId] = useState(t2iModels[0].id);
+  const [imageMode, setImageMode] = useState(false); // 任务服务当前仅支持文生图
+  const [catalogModels, setCatalogModels] = useState([]);
+  const [selectedModelId, setSelectedModelId] = useState(null);
   const [selectedFamilyId, setSelectedFamilyId] = useState(initialFamily.id);
   const [selectedAr, setSelectedAr] = useState(
     t2iModels[0].inputs?.aspect_ratio?.default || "1:1",
@@ -1015,43 +1039,59 @@ export default function ImageStudio({
   const [dropdownOpen, setDropdownOpen] = useState(null); // 'model' | 'ar' | 'quality' | null
   const [generating, setGenerating] = useState(false);
   const [generateError, setGenerateError] = useState(null);
-  const [resolvedTaskModelId, setResolvedTaskModelId] = useState(taskModelId);
-  const [taskModelLoading, setTaskModelLoading] = useState(!taskModelId);
+  const [taskModelLoading, setTaskModelLoading] = useState(true);
   const [taskModelError, setTaskModelError] = useState(null);
+  const [catalogRetry, setCatalogRetry] = useState(0);
   const [fullscreenUrl, setFullscreenUrl] = useState(null);
+  const studioHistory = useStudioHistory(accountId, "image");
+  const useAccountHistory = Boolean(accountId);
+  const activeHistoryItems = useAccountHistory ? studioHistory.items : historyItems;
+  const isHistoryLoading = useAccountHistory && studioHistory.loading;
 
   useEffect(() => {
-    if (taskModelId) {
-      setResolvedTaskModelId(taskModelId);
-      setTaskModelLoading(false);
-      setTaskModelError(null);
-      return undefined;
-    }
+    const controller = new AbortController();
     let active = true;
     setTaskModelLoading(true);
-    getImageTaskModel()
-      .then((model) => {
+    setTaskModelError(null);
+    setCatalogModels([]);
+    setSelectedModelId(null);
+    getImageTaskCatalog({ signal: controller.signal })
+      .then((models) => {
         if (!active) return;
-        setResolvedTaskModelId(model?.logicalModelId || null);
-        setTaskModelError(model ? null : "NO_IMAGE_TASK_MODEL");
+        setCatalogModels(models);
+        setImageMode(false);
+        const requested = taskModelId == null ? null : models.find((model) => model.logicalModelId === taskModelId);
+        if (taskModelId != null && !requested) {
+          setSelectedModelId(null);
+          setTaskModelError("TASK_MODEL_NOT_IN_CATALOG");
+          return;
+        }
+        const nextModel = requested || models[0] || null;
+        setSelectedModelId(nextModel?.logicalModelId ?? null);
+        setTaskModelError(nextModel ? null : "NO_IMAGE_TASK_MODEL");
       })
       .catch((error) => {
-        if (!active) return;
-        setResolvedTaskModelId(null);
-        setTaskModelError(error.code || "CATALOG_QUERY_FAILED");
+        if (!active || error?.name === "AbortError") return;
+        setCatalogModels([]);
+        setSelectedModelId(null);
+        const safeCode = ["CATALOG_QUERY_FAILED", "CATALOG_UNAVAILABLE", "UNAUTHENTICATED", "FORBIDDEN", "MFA_REQUIRED", "INVALID_IMAGE_CATALOG", "DUPLICATE_IMAGE_MODEL_ID"].includes(error?.code)
+          ? error.code : "CATALOG_QUERY_FAILED";
+        setTaskModelError(safeCode);
       })
       .finally(() => {
         if (active) setTaskModelLoading(false);
       });
-    return () => { active = false; };
-  }, [taskModelId]);
+    return () => {
+      active = false;
+      controller.abort();
+    };
+  }, [taskModelId, catalogRetry, accountId]);
   const [isDrawModalOpen, setIsDrawModalOpen] = useState(false);
 
   // ── Canvas / history state ──────────────────────────────────────────────
   const [currentImageUrl, setCurrentImageUrl] = useState(null);
   const [activeHistoryIdx, setActiveHistoryIdx] = useState(0);
-  const [batchSize, setBatchSize] = useState(1);
-  const [localHistory, setLocalHistory] = useState([]); // [{id,url,prompt,model,aspect_ratio,timestamp}]
+  const [localHistory, setLocalHistory] = useState([]);
 
   // 删除确认走应用内的 ConfirmDialog，而不是浏览器原生 confirm：原生弹窗
   // 会带出「<host> 显示」标题、按钮文案跟随浏览器语言、并且无法展示「删除中」
@@ -1060,8 +1100,8 @@ export default function ImageStudio({
   const [deleteBusy, setDeleteBusy] = useState(false);
   const [deleteError, setDeleteError] = useState(null);
 
-  // Use prop history if provided, otherwise local
-  const history = historyItems ?? localHistory;
+  // Explicit callers can provide their own history; standalone signed-in studios use the account API.
+  const history = activeHistoryItems ?? localHistory;
 
   // When historyItems is server-backed (White Label / backfilled sessions),
   // localHistory isn't what's rendered — removal has to go through the
@@ -1075,12 +1115,15 @@ export default function ImageStudio({
   const handleDeleteEntry = useCallback(async (entry, idx) => {
     const assetId = entry?.assetId || assetIdFromResultUrl(entry?.url);
     if (assetId) await deleteAsset(assetId);
-    if (historyItems && onDeleteHistoryItem) {
+    if (useAccountHistory) {
+      await studioHistory.refresh();
+      invalidateAssets(accountId);
+    } else if (historyItems && onDeleteHistoryItem) {
       await onDeleteHistoryItem(entry);
     } else {
       setLocalHistory((prev) => prev.filter((_, i) => i !== idx));
     }
-  }, [historyItems, onDeleteHistoryItem]);
+  }, [useAccountHistory, studioHistory.refresh, historyItems, onDeleteHistoryItem]);
 
   const describeDeleteError = useCallback((err) => (
     err?.code === "ASSET_NOT_DELETABLE"
@@ -1121,7 +1164,15 @@ export default function ImageStudio({
   const dropdownRef = useRef(null);
   const uploadPickerResetRef = useRef(null); // not used directly — managed via key
   const selectionRef = useRef(null);
+  const generationControllerRef = useRef(null);
   selectionRef.current = { imageMode, selectedFamilyId, selectedModelId };
+
+  const generationActiveRef = useRef(false);
+  useEffect(() => () => {
+    generationActiveRef.current = false;
+    generationControllerRef.current?.abort();
+    generationControllerRef.current = null;
+  }, []);
 
   // ── Close dropdown on outside click ─────────────────────────────────────
   useEffect(() => {
@@ -1141,34 +1192,20 @@ export default function ImageStudio({
       const stored = localStorage.getItem(PERSIST_KEY);
       if (stored) {
         const data = JSON.parse(stored);
-        if (data.imageMode !== undefined) setImageMode(data.imageMode);
-        if (data.selectedModelId) {
-          const restoredFamily = imageModelCatalog.familyByVariantId.get(data.selectedModelId);
-          const restoredVariant = imageModelCatalog.variantById.get(data.selectedModelId);
-          if (restoredFamily) {
-            setSelectedModelId(data.selectedModelId);
-            setSelectedFamilyId(restoredFamily.id);
-            setModelParameterValues(
-              createModelParameterValues(
-                restoredVariant?.model,
-                data.modelParameterValues || {},
-              ),
-            );
-          }
-        }
+        // 任务服务仅支持文生图，旧编辑模式和参考图不得恢复到当前草稿。
+        setImageMode(false);
+        setUploadedImageUrls([]);
         if (data.selectedAr) setSelectedAr(data.selectedAr);
         if (data.selectedQuality) setSelectedQuality(data.selectedQuality);
         if (data.selectedEffect) setSelectedEffect(data.selectedEffect);
         if (data.prompt) setPrompt(data.prompt);
-        if (data.uploadedImageUrls) setUploadedImageUrls(data.uploadedImageUrls);
         if (data.uploadHistory) setUploadHistory(data.uploadHistory);
-        if (data.batchSize) setBatchSize(data.batchSize);
-        if (data.localHistory) setLocalHistory(data.localHistory);
+        if (!accountId && data.localHistory) setLocalHistory(data.localHistory);
       }
     } catch (err) {
       console.warn("Failed to load ImageStudio persistence:", err);
     }
-  }, []);
+  }, [PERSIST_KEY, accountId]);
 
   // ── Adjust height on load ────────────────────────────────────────────────
   // ── Persistence: Save ────────────────────────────────────────────────────
@@ -1182,12 +1219,10 @@ export default function ImageStudio({
           selectedAr,
           selectedQuality,
           selectedEffect,
-          modelParameterValues,
           prompt,
           uploadedImageUrls,
           uploadHistory,
-          batchSize,
-          localHistory,
+          ...(!accountId ? { localHistory } : {}),
         };
         localStorage.setItem(PERSIST_KEY, JSON.stringify(state));
       } catch (err) {
@@ -1206,8 +1241,9 @@ export default function ImageStudio({
     prompt,
     uploadedImageUrls,
     uploadHistory,
-    batchSize,
     localHistory,
+    accountId,
+    PERSIST_KEY,
   ]);
 
   const processDroppedImages = async (files) => {
@@ -1221,14 +1257,9 @@ export default function ImageStudio({
     }
 
     const family = imageModelCatalog.familyById.get(selectedFamilyId);
-    const editor = getFamilyVariant(
-      imageModelCatalog,
-      family,
-      "i2i",
-      selectedModelId,
-    );
+    const editor = null;
     if (!editor) {
-      toast.error(copy.errors.noImageReferenceSupport.replace("{name}", family.name));
+      toast.error("参考图功能尚未接入任务服务。");
       return;
     }
 
@@ -1274,32 +1305,27 @@ export default function ImageStudio({
   }, [droppedFiles, onFilesHandled, processDroppedImages]);
 
   // ── Derived: current model lists & helpers ───────────────────────────────
-  const currentAspectRatios = imageMode
-    ? getAspectRatiosForI2IModel(selectedModelId)
-    : getAspectRatiosForModel(selectedModelId);
-  const currentResolutions = imageMode
-    ? getResolutionsForI2IModel(selectedModelId)
-    : getResolutionsForModel(selectedModelId);
-  const currentQualityField = imageMode
-    ? getQualityFieldForI2IModel(selectedModelId)
-    : getQualityFieldForModel(selectedModelId);
-  const showQualityBtn = currentResolutions.length > 0;
-  const currentEffects = imageMode ? getEffectsForI2IModel(selectedModelId) : [];
-  const showEffectBtn = currentEffects.length > 0;
+  const currentAspectRatios = IMAGE_TASK_ASPECT_RATIOS;
+  const currentResolutions = [];
+  const currentQualityField = null;
+  const showQualityBtn = false;
+  const currentEffects = [];
+  const showEffectBtn = false;
   const selectedFamily = imageModelCatalog.familyById.get(selectedFamilyId) || initialFamily;
+  const selectedCatalogModel = catalogModels.find((model) => model.logicalModelId === selectedModelId) || null;
   const selectedPickerEntry = imageModelPickerEntryByVariantId.get(selectedModelId);
-  const selectedModelDisplayName = selectedPickerEntry?.name || selectedFamily.name;
-  const currentMode = imageMode ? "i2i" : "t2i";
-  const selectedVariant = imageModelCatalog.variantById.get(selectedModelId);
-  const supplementalInputs = getSupplementalModelInputs(selectedVariant?.model);
-  const referenceVariant = getImageReferenceVariant(
-    imageModelCatalog,
-    selectedFamily,
-    selectedModelId,
-  );
-  const referenceImageLimit = referenceVariant
-    ? getModelMediaCapabilities(referenceVariant.model).image.maxItems
-    : 1;
+  const selectedModelDisplayName = selectedCatalogModel?.displayName || copy.popovers.model;
+  const canGenerate = !generating && !taskModelLoading && !taskModelError
+    && Boolean(selectedCatalogModel && prompt.trim());
+  const catalogStatus = taskModelLoading ? "loading"
+    : taskModelError === "NO_IMAGE_TASK_MODEL" ? "empty"
+      : taskModelError ? "error" : "loaded";
+  const catalogStatusCode = taskModelLoading ? "IMAGE_MODEL_CATALOG_LOADING" : taskModelError;
+  const currentMode = "t2i";
+  const selectedVariant = null;
+  const supplementalInputs = [];
+  const referenceVariant = null;
+  const referenceImageLimit = 0;
 
   const applySelectedVariant = useCallback((variant, mode, family) => {
     const model = variant.model;
@@ -1377,45 +1403,37 @@ export default function ImageStudio({
 
   const handleUploadClear = useCallback(() => {
     setUploadedImageUrls([]);
-    const selection = selectionRef.current;
-    const family = imageModelCatalog.familyById.get(selection.selectedFamilyId);
-    const target = getFamilyVariant(
-      imageModelCatalog,
-      family,
-      "t2i",
-      selection.selectedModelId,
-    );
-    if (target) applySelectedVariant(target, "t2i", family);
-  }, [applySelectedVariant]);
+    setImageMode(false);
+  }, []);
 
   // ── Model selection ──────────────────────────────────────────────────────
-  const handleModelSelect = (pickerEntry, category = "all") => {
-    const { family, variantsByMode, defaultVariant } = pickerEntry;
-    const target = category !== "all"
-      ? variantsByMode[category]
-      : uploadedImageUrls.length > 0 && variantsByMode.i2i
-        ? variantsByMode.i2i
-        : variantsByMode[currentMode] || defaultVariant;
-    if (!target) return;
-
-    applyUserSelectedVariant(target, target.mode, family);
+  const handleModelSelect = (logicalModelId) => {
+    if (!catalogModels.some((model) => model.logicalModelId === logicalModelId)) return;
+    setSelectedModelId(logicalModelId);
+    setTaskModelError(null);
   };
 
   // ── History helpers ──────────────────────────────────────────────────────
   const addToHistory = useCallback(
     (entry) => {
-      if (!historyItems) {
+      if (useAccountHistory) {
+        void studioHistory.refresh();
+        invalidateAssets(accountId);
+      } else if (!historyItems) {
         setLocalHistory((prev) => [entry, ...prev.slice(0, 49)]);
       }
       setActiveHistoryIdx(0);
       setCurrentImageUrl(entry.url);
     },
-    [historyItems],
+    [useAccountHistory, studioHistory.refresh, historyItems],
   );
 
   // ── View state ─────────────────────────────────────
 
   const resetToPrompt = () => {
+    generationActiveRef.current = false;
+    generationControllerRef.current?.abort();
+    generationControllerRef.current = null;
     setCurrentImageUrl(null);
     setPrompt("");
     setUploadedImageUrls([]);
@@ -1424,7 +1442,7 @@ export default function ImageStudio({
     const ars = getAspectRatiosForModel(firstT2I.id);
     const resolutions = getResolutionsForModel(firstT2I.id);
     const family = imageModelCatalog.familyByVariantId.get(firstT2I.id);
-    setSelectedModelId(firstT2I.id);
+    setSelectedModelId(catalogModels[0]?.logicalModelId ?? null);
     setSelectedFamilyId(family.id);
     setSelectedAr(ars[0] || "1:1");
     setSelectedQuality(resolutions[0] || null);
@@ -1435,127 +1453,68 @@ export default function ImageStudio({
   // ── Generation ───────────────────────────────────────────────────────────
   const handleGenerate = async () => {
     if (generating) return;
-
-    if (resolvedTaskModelId && imageMode) {
-      const message = "Image-to-image is not available through the task service yet.";
+    if (imageMode || uploadedImageUrls.length > 0 || swapImageUrl) {
+      const message = "参考图和图生图功能尚未接入任务服务。";
+      setGenerateError(message);
+      onGenerationError?.(message);
+      return;
+    }
+    if (!prompt.trim()) {
+      alert(copy.errors.enterPromptFirst);
+      return;
+    }
+    if (taskModelLoading) {
+      setGenerateError("IMAGE_MODEL_CATALOG_LOADING");
+      return;
+    }
+    if (!selectedModelId || !catalogModels.some((model) => model.logicalModelId === selectedModelId)) {
+      const message = taskModelError || "IMAGE_TASK_MODEL_UNAVAILABLE";
       setGenerateError(message);
       onGenerationError?.(message);
       return;
     }
 
-    if (imageMode) {
-      if (uploadedImageUrls.length === 0) {
-        alert(copy.errors.uploadReferenceFirst);
-        return;
-      }
-      const modelInfo = getI2IModelById(selectedModelId);
-      if (modelInfo?.swapField && !swapImageUrl) {
-        alert(copy.errors.uploadSwapFaceFirst);
-        return;
-      }
-    } else {
-      const imageCapability = getModelMediaCapabilities(selectedVariant?.model).image;
-      if (uploadedImageUrls.length > 0 && imageCapability.maxItems === 0) {
-        alert(copy.errors.noImageReferenceSupport.replace("{name}", selectedModelDisplayName));
-        return;
-      }
-      if (!prompt.trim()) {
-        alert(copy.errors.enterPromptFirst);
-        return;
-      }
-    }
-
     onGenerationStart?.();
     setGenerating(true);
     setGenerateError(null);
-
+    const controller = new AbortController();
+    generationControllerRef.current = controller;
+    generationActiveRef.current = true;
     try {
-      const results = await Promise.all(
-        Array.from({ length: batchSize }).map(async () => {
-          if (imageMode) {
-            const genParams = {
-              model: selectedModelId,
-              ...buildSupplementalInputPayload(
-                selectedVariant?.model,
-                modelParameterValues,
-              ),
-              images_list: uploadedImageUrls,
-              image_url: uploadedImageUrls[0],
-              aspect_ratio: selectedAr,
-            };
-            if (swapImageUrl) genParams.swap_url = swapImageUrl;
-            if (prompt.trim()) genParams.prompt = prompt.trim();
-            if (currentQualityField && selectedQuality) {
-              genParams[currentQualityField] = selectedQuality;
-            }
-            if (showEffectBtn && selectedEffect) genParams.name = selectedEffect;
-            return await generateI2I(apiKey, genParams);
-          } else {
-            const referenceParams = buildReferenceParams(selectedVariant?.model, {
-              imageUrls: uploadedImageUrls,
-            });
-            const genParams = {
-              model: selectedModelId,
-              ...buildSupplementalInputPayload(
-                selectedVariant?.model,
-                modelParameterValues,
-              ),
-              ...referenceParams,
-              prompt: prompt.trim(),
-              aspect_ratio: selectedAr,
-            };
-            if (currentQualityField && selectedQuality) {
-              genParams[currentQualityField] = selectedQuality;
-            }
-            if (taskModelLoading) throw new Error("IMAGE_MODEL_CATALOG_LOADING");
-            if (!resolvedTaskModelId) throw new Error(taskModelError || "IMAGE_TASK_MODEL_UNAVAILABLE");
-            {
-              const createdTask = await createImageTask({
-                logicalModelId: resolvedTaskModelId,
-                prompt: prompt.trim(),
-                aspectRatio: selectedAr,
-              });
-              const completedTask = await waitForImageTask(createdTask.id);
-              return {
-                id: completedTask.id,
-                assetId: completedTask.result.assetId
-                  || assetIdFromResultUrl(completedTask.result.resultUrl),
-                url: completedTask.result.resultUrl,
-              };
-            }
-            return await generateImage(apiKey, genParams);
-          }
-        })
-      );
-
-      results.forEach((res) => {
-        if (res && res.url) {
-          const entry = {
-            id: res.id || Math.random().toString(36).substring(7),
-            assetId: res.assetId || assetIdFromResultUrl(res.url),
-            url: res.url,
-            prompt: prompt.trim(),
-            model: selectedModelId,
-            aspect_ratio: selectedAr,
-            timestamp: new Date().toISOString(),
-          };
-          addToHistory(entry);
-          onGenerationComplete?.({
-            url: res.url,
-            model: selectedModelId,
-            prompt: prompt.trim(),
-            type: "image",
-          });
-        }
+      const aspectRatio = IMAGE_TASK_ASPECT_RATIOS.includes(selectedAr) ? selectedAr : "1:1";
+      const createdTask = await createImageTask({
+        logicalModelId: selectedModelId,
+        outputCount: 1,
+        prompt: prompt.trim(),
+        aspectRatio,
+        signal: controller.signal,
       });
+      const completedTask = await waitForImageTask(createdTask.id, { signal: controller.signal });
+      if (!generationActiveRef.current || controller.signal.aborted) return;
+      const url = completedTask.result.resultUrl;
+      addToHistory({
+        id: completedTask.id,
+        assetId: completedTask.result.assetId || assetIdFromResultUrl(url),
+        url,
+        prompt: prompt.trim(),
+        model: selectedModelId,
+        aspect_ratio: aspectRatio,
+        timestamp: new Date().toISOString(),
+      });
+      onGenerationComplete?.({ url, model: selectedModelId, prompt: prompt.trim(), type: "image" });
     } catch (e) {
+      if (!generationActiveRef.current || e?.name === "AbortError") return;
       console.error("[ImageStudio] Generation failed:", e);
       const errMsg = e?.code === "IMAGE_RESULT_NOT_AVAILABLE"
         ? "The task completed, but its image has not been archived for preview yet."
         : formatErrorMessage(e, copy.errors.generationFailed);
+      setGenerateError(errMsg);
       if (onGenerationError) onGenerationError(errMsg);
       else toast.error(errMsg);
     } finally {
+      if (generationControllerRef.current === controller) generationControllerRef.current = null;
+      generationActiveRef.current = false;
+      controller.abort();
       setGenerating(false);
       onGenerationEnd?.();
     }
@@ -1574,11 +1533,19 @@ export default function ImageStudio({
       
       {/* ── CENTRAL GALLERY AREA ── */}
       <div className="flex-1 w-full max-w-7xl mx-auto overflow-y-auto custom-scrollbar pb-40 lg:pb-32 px-2">
-        {taskModelError && (
-          <div role="status" className="mx-auto mt-6 max-w-xl rounded-xl border border-amber-400/20 bg-amber-400/5 px-4 py-3 text-center text-sm text-amber-100/80">
-            {taskModelError === "NO_IMAGE_TASK_MODEL"
-              ? "No image generation model is available for this session."
-              : "The image model catalog is unavailable. Please sign in and try again."}
+        {useAccountHistory && studioHistory.error && (
+          <div role="alert" className="mt-4 text-center text-sm text-red-300">
+            {locale === "zh" ? "账号历史加载失败，不会显示本地历史。" : "Account history could not be loaded. Local history is not used."}
+            <button type="button" className="ml-2 underline" disabled={isHistoryLoading} onClick={() => void studioHistory.retry()}>
+              {locale === "zh" ? "重试" : "Retry"}
+            </button>
+          </div>
+        )}
+        {isHistoryLoading && <div role="status" className="py-4 text-center text-sm text-white/60">{locale === "zh" ? "正在加载历史…" : "Loading history…"}</div>}
+        {generateError && (
+          <div role="alert" className="mt-4 text-center text-sm text-red-300">
+            {generateError}
+            <button type="button" className="ml-2 underline" disabled={!canGenerate} onClick={handleGenerate}>{locale === "zh" ? "重试生成" : "Retry generation"}</button>
           </div>
         )}
         {history.length > 0 ? (
@@ -1669,7 +1636,7 @@ export default function ImageStudio({
               </div>
             ))}
           </div>
-        ) : (
+        ) : !isHistoryLoading && !(useAccountHistory && studioHistory.error) ? (
           <div className="flex flex-col items-center justify-center h-full animate-fade-in-up transition-all duration-700 min-h-[50vh]">
             {/* Overlapping floating cards */}
             <div className="flex items-center justify-center gap-1.5 md:gap-3 mb-10 select-none scale-90 sm:scale-100">
@@ -1713,11 +1680,48 @@ export default function ImageStudio({
               {copy.emptyState.subtitle}
             </p>
           </div>
+        ) : null}
+        {useAccountHistory && studioHistory.nextCursor && !studioHistory.error && (
+          <button type="button" className="mx-auto my-4 block text-sm text-primary underline" disabled={isHistoryLoading} onClick={() => void studioHistory.loadMore()}>
+            {locale === "zh" ? "加载更多" : "Load more"}
+          </button>
         )}
       </div>
 
       {/* ── BOTTOM PROMPT BAR ── */}
       <PromptComposer>
+          <div
+            role={catalogStatus === "error" || catalogStatus === "empty" ? "alert" : "status"}
+            aria-live="polite"
+            className="flex flex-wrap items-center gap-2 text-xs text-amber-200"
+            data-image-catalog-status={catalogStatus}
+          >
+            <span>
+              {catalogStatus === "loading"
+                ? (locale === "zh" ? "正在加载图片模型目录…" : "Loading image model catalog…")
+                : catalogStatus === "empty"
+                  ? (locale === "zh" ? "图片模型目录为空，暂无文生图模型。" : "The image model catalog is empty; no text-to-image models are available.")
+                  : catalogStatus === "error"
+                    ? (locale === "zh" ? "图片模型目录加载失败或所选模型不可用，暂不能生成。" : "The image catalog failed to load or the selected model is unavailable; generation is unavailable.")
+                    : (locale === "zh" ? `已加载 ${catalogModels.length} 个文生图模型。` : `${catalogModels.length} text-to-image models loaded.`)}
+            </span>
+            {catalogStatusCode && <code>{catalogStatusCode}</code>}
+            <button
+              type="button"
+              className="underline disabled:opacity-50"
+              disabled={taskModelLoading || generating}
+              onClick={() => setCatalogRetry((count) => count + 1)}
+            >
+              {locale === "zh" ? "重试加载图片模型" : "Retry image models"}
+            </button>
+            {catalogStatus === "empty" && (
+              <span className="basis-full">
+                {locale === "zh"
+                  ? "若用于本地 Mock 测试且尚未开启 Mock，请在启动器显式设置 PAINTTRACK_LOCAL_MOCK_ROUTING=1 并完整重启启动器；生成还需开启 Worker。空目录不代表已确认 Mock 未开启，不会自动回退到 Mock。"
+                  : "For local Mock testing, if Mock is not enabled, explicitly set PAINTTRACK_LOCAL_MOCK_ROUTING=1 in the launcher and fully restart it; generation also requires a Worker. An empty catalog does not confirm that Mock is disabled, and never triggers an automatic Mock fallback."}
+              </span>
+            )}
+          </div>
           {/* Top row: upload picker + textarea */}
           <div className="flex flex-col gap-3">
             {/* Inline list of uploaded files */}
@@ -1740,31 +1744,7 @@ export default function ImageStudio({
               ))}
               
               {/* Main Upload Trigger */}
-              {referenceVariant && uploadedImageUrls.length < referenceImageLimit && (
-                <UploadButton
-                  apiKey={apiKey}
-                  maxImages={referenceImageLimit}
-                  onSelect={handleUploadSelect}
-                  onClear={handleUploadClear}
-                  initialUrls={uploadedImageUrls}
-                  persistedHistory={uploadHistory}
-                  onHistoryChange={setUploadHistory}
-                  copy={copy}
-                />
-              )}
-
-              {/* Swap Image Upload Trigger */}
-              {imageMode && getI2IModelById(selectedModelId)?.swapField && (
-                <UploadButton
-                  apiKey={apiKey}
-                  maxImages={1}
-                  onSelect={({ urls }) => setSwapImageUrl(urls[0] || null)}
-                  onClear={() => setSwapImageUrl(null)}
-                  initialUrls={swapImageUrl ? [swapImageUrl] : []}
-                  label={copy.promptBar.swapFaceLabel}
-                  copy={copy}
-                />
-              )}
+              {/* 参考图和图生图控件尚未接入任务服务，暂不显示。 */}
             </div>
 
             {/* Input prompt text area */}
@@ -1792,20 +1772,6 @@ export default function ImageStudio({
                     active: dropdownOpen === "model",
                   })}
                 >
-                  <div className="w-4 h-4 rounded overflow-hidden shrink-0 flex items-center justify-center bg-white/5">
-                    {(() => {
-                      const selectedModelProvider = selectedFamily.provider || 'muapi';
-                      return PROVIDER_LOGOS[selectedModelProvider] ? (
-                        <img 
-                          src={PROVIDER_LOGOS[selectedModelProvider]} 
-                          alt="" 
-                          className={`w-full h-full object-contain ${invertLogos.includes(selectedModelProvider) ? "invert" : ""}`} 
-                        />
-                      ) : (
-                        <span className="text-[9px] font-bold text-black uppercase">G</span>
-                      );
-                    })()}
-                  </div>
                   <span className={PROMPT_CONTROL_LABEL_CLASS}>
                     {selectedModelDisplayName}
                   </span>
@@ -1818,30 +1784,17 @@ export default function ImageStudio({
                     className="w-[calc(100vw-2rem)] md:w-[480px] max-w-md md:max-w-none max-h-[70vh]"
                   >
                     <PromptPopoverHeader>{copy.popovers.model}</PromptPopoverHeader>
-                    <ModelDropdown
-                      selectedModel={selectedModelId}
+                    <CatalogModelSelect
+                      models={catalogModels}
+                      selectedModelId={selectedModelId}
                       onSelect={handleModelSelect}
-                      onClose={() => setDropdownOpen(null)}
+                      disabled={taskModelLoading}
                       copy={copy}
                     />
                   </PromptPopover>
                 )}
               </div>
 
-              <ModelParameterControls
-                inputs={supplementalInputs}
-                values={modelParameterValues}
-                onChange={(key, value) =>
-                  setModelParameterValues((values) => ({ ...values, [key]: value }))
-                }
-                open={dropdownOpen === "parameters"}
-                onToggle={(event) => {
-                  event.stopPropagation();
-                  setDropdownOpen((open) =>
-                    open === "parameters" ? null : "parameters",
-                  );
-                }}
-              />
 
               {/* Aspect ratio button */}
               <div className="relative">
@@ -1949,27 +1902,6 @@ export default function ImageStudio({
                 </div>
               )}
 
-              {/* Batch size stepper */}
-              <div className={promptControlClassName({ compact: true, className: "select-none" })}>
-                <button
-                  type="button"
-                  onClick={() => setBatchSize(prev => Math.max(1, prev - 1))}
-                  className="text-white/40 hover:text-white/80 font-extrabold text-xs transition-colors px-1"
-                >
-                  -
-                </button>
-                <span className="text-xs font-semibold text-white/70 min-w-[24px] text-center">
-                  {batchSize}/4
-                </span>
-                <button
-                  type="button"
-                  onClick={() => setBatchSize(prev => Math.min(4, prev + 1))}
-                  className="text-white/40 hover:text-white/80 font-extrabold text-xs transition-colors px-1"
-                >
-                  +
-                </button>
-              </div>
-
               {/* Draw button */}
               <button
                 type="button"
@@ -1987,9 +1919,9 @@ export default function ImageStudio({
             </PromptControls>
 
             {/* Generate button */}
-            <PromptAction
+              <PromptAction
               onClick={handleGenerate}
-              disabled={generating || taskModelLoading || !resolvedTaskModelId}
+              disabled={!canGenerate}
             >
               {generating ? (
                 <>

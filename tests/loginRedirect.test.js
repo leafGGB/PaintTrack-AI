@@ -38,6 +38,24 @@ test('login next-path policy accepts only same-origin application paths', () => 
     assert.equal(safeNextPath('/register'), '/studio');
 });
 
+test('actual login redirect functions preserve deep admin destinations through MFA', () => {
+    const start = loginPage.indexOf('function getSafeNextPath()');
+    const end = loginPage.indexOf('export default function LoginPage()', start);
+    assert.ok(start >= 0 && end > start);
+    const window = {
+        location: { origin: 'http://127.0.0.1:3000', pathname: '/login', search: '' },
+    };
+    const redirects = new Function('window', `${loginPage.slice(start, end)}; return { getSafeNextPath, getPostLoginPath };`)(window);
+    for (const destination of ['/admin/users', '/zh/admin/users?email=operator%40example.test#detail', '/admin/models']) {
+        window.location.search = `?next=${encodeURIComponent(destination)}`;
+        assert.equal(redirects.getSafeNextPath(), destination);
+        assert.equal(redirects.getPostLoginPath({ role: 'admin', authLevel: 'mfa' }), destination);
+        const stepUp = new URL(redirects.getPostLoginPath({ role: 'admin', authLevel: 'password' }), window.location.origin);
+        assert.ok(['/account', '/zh/account'].includes(stepUp.pathname));
+        assert.equal(stepUp.searchParams.get('next'), destination);
+    }
+});
+
 test('login sends password-level administrators to MFA account center and preserves safe next path', () => {
     assert.match(loginPage, /function getPostLoginPath\(user\)/);
     assert.match(loginPage, /user\?\.role !== 'admin' \|\| user\.authLevel === 'mfa'/);

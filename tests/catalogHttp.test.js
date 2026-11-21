@@ -67,6 +67,36 @@ function createHandler(options = {}) {
     return { handler, sink };
 }
 
+test('受控目录只为就绪宿主的指定会话返回文生图，不回退到普通目录', async () => {
+    const secret = 'a'.repeat(64);
+    const environment = { NODE_ENV: 'development', APP_BASE_URL: ORIGIN, PAINTTRACK_LOCAL_INTERNAL_GUARD: '1',
+        PAINTTRACK_LOCAL_CONTROLLED_IMAGE: '1', PAINTTRACK_CONTROLLED_IMAGE_OWNER: USER_ID,
+        PAINTTRACK_LOCAL_MAILBOX_SECRET: secret,
+        DATABASE_URL: 'postgres://pt_local_runtime_ci_aabb00112233:fixture@127.0.0.1:5433/pt_local_auth_ci_aabb00112233' };
+    const makeHandler = (config, authenticated = true) => createCatalogHandler({ environment: config, sink: createSink(),
+        database: fakeDatabase({ authenticated }), serviceFactory() { assert.fail('受控目录不可回退'); } });
+    const request = (media, ready = true, cookie) => {
+        const req = makeRequest({ media, cookie });
+        req.headers.set('x-painttrack-local-capability', secret);
+        if (ready) req.headers.set('x-painttrack-controlled-image-ready', secret);
+        return req;
+    };
+    const handler = makeHandler(environment);
+    const image = await handler(request('?media=image'));
+    assert.equal(image.status, 200);
+    assert.equal(image.headers.get('cache-control'), 'no-store');
+    assert.deepEqual((await image.json()).models.map(model => model.logicalModelId), ['local-controlled-image']);
+    assert.deepEqual((await (await handler(request('?media=video'))).json()).models, []);
+    assert.equal((await handler(request('?media=image', false))).status, 503);
+    assert.equal((await makeHandler(environment, false)(request('?media=image', true, null))).status, 401);
+    const otherOwner = makeHandler({ ...environment, PAINTTRACK_CONTROLLED_IMAGE_OWNER: randomUUID() });
+    assert.deepEqual((await (await otherOwner(request('?media=image'))).json()).models, []);
+    for (const overrides of [{ NODE_ENV: 'production' }, { PAINTTRACK_LOCAL_MOCK_ROUTING: '1' },
+        { PAINTTRACK_CHARGED_SUBMISSION: '1' }, { PAINTTRACK_LOCAL_CONTROLLED_IMAGE: 'true' }]) {
+        assert.equal((await makeHandler({ ...environment, ...overrides })(request('?media=image'))).status, 503);
+    }
+});
+
 test('catalog requires an authenticated session', async () => {
     const { handler } = createHandler({ database: fakeDatabase({ authenticated: false }) });
     const response = await handler(makeRequest({ cookie: null }));
@@ -161,6 +191,13 @@ test('local mock model is exposed only behind the guarded development route', as
     assert.equal(body.models.length, 1);
     assert.equal(body.models[0].logicalModelId, 'local-mock-image');
     assert.deepEqual(body.models[0].operations, ['image.generate']);
+
+    const videoResponse = await handler(makeRequest({ media: '?media=video' }));
+    assert.equal(videoResponse.status, 200);
+    const videoBody = await videoResponse.json();
+    assert.equal(videoBody.models.length, 1);
+    assert.equal(videoBody.models[0].logicalModelId, 'local-mock-video');
+    assert.deepEqual(videoBody.models[0].operations, ['video.generate']);
 
     const forbiddenHandler = createCatalogHandler({
         database: fakeDatabase({ pool: { async query() { return { rows: [] }; } } }),

@@ -11,7 +11,7 @@ test('image and video synthetic catalog resolves distinct immutable snapshots wi
     const catalog = createLocalMockCatalog(enabled);
     const resolver = createModelRouteResolver({ catalog });
     for (const media of ['image', 'video']) {
-        const route = await resolver.resolve({ taskType: `${media}.generate`, payload: { logicalModelId: `local-mock-${media}` } });
+        const route = await resolver.resolve({ taskType: `${media}.generate`, payload: { logicalModelId: `local-mock-${media}`, ...(media === 'image' ? { outputCount: 1 } : { durationMs: 1000, fps: 1 }) } });
         assert.equal(route.routeSnapshot.adapterType, 'mock');
         assert.equal(route.routeSnapshot.capabilitySnapshot.mediaType, media);
         assert.ok(Object.isFrozen(route.routeSnapshot));
@@ -22,10 +22,14 @@ test('image and video synthetic catalog resolves distinct immutable snapshots wi
     }
     assert.equal(await catalog.getLogicalModel('unapproved'), null);
 });
-test('launcher does not inherit mock routing flag and only passes explicit option', () => {
+test('launcher does not inherit mock routing or charged submission flags and only passes explicit options', () => {
     const config = { runtimeUrl: 'unused', internalPort: 3001, origin: 'http://127.0.0.1:3000', secret: 'synthetic', suffix: 'test', heapMb: 3072 };
-    assert.equal(createNextEnvironment(config, enabled).PAINTTRACK_LOCAL_MOCK_ROUTING, undefined);
-    assert.equal(createNextEnvironment({ ...config, mockRouting: true }, {}).PAINTTRACK_LOCAL_MOCK_ROUTING, '1');
+    assert.equal(createNextEnvironment(config, { ...enabled, PAINTTRACK_CHARGED_SUBMISSION: '1' }).PAINTTRACK_LOCAL_MOCK_ROUTING, undefined);
+    assert.equal(createNextEnvironment(config, { ...enabled, PAINTTRACK_CHARGED_SUBMISSION: '1' }).PAINTTRACK_CHARGED_SUBMISSION, undefined);
+    const env = createNextEnvironment({ ...config, mockRouting: true, chargedSubmission: true }, {});
+    assert.equal(env.PAINTTRACK_LOCAL_MOCK_ROUTING, '1');
+    assert.equal(env.PAINTTRACK_CHARGED_SUBMISSION, '1');
+    assert.equal(createNextEnvironment({ ...config, mockRouting: true }, {}).PAINTTRACK_CHARGED_SUBMISSION, undefined);
 });
 test('Worker mock selector environment requires explicit launcher option', async () => {
     const { createLocalMockProviderSelector } = require('../lib/server/tasks/localMockCatalog');
@@ -66,6 +70,6 @@ test('synthetic source identities and nested catalog replies cannot mutate later
     const first = await catalog.getLogicalModel('local-mock-image');
     first.bindings[0].providerInstance.adapterType = 'external';
     first.bindings[0].providerModel.capabilities.operations.length = 0;
-    const resolved = await createModelRouteResolver({ catalog }).resolve({ taskType: 'image.generate', payload: { logicalModelId: 'local-mock-image' } });
+    const resolved = await createModelRouteResolver({ catalog }).resolve({ taskType: 'image.generate', payload: { logicalModelId: 'local-mock-image', outputCount: 1 } });
     assert.equal(resolved.routeSnapshot.adapterType, 'mock');
 });

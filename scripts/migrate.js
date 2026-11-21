@@ -2,7 +2,7 @@ const { getEnvironment } = require('../lib/server/env');
 const { migrateDatabase } = require('../lib/server/db/migrate');
 
 async function main() {
-    await migrateDatabase(getEnvironment());
+    await migrateDatabase({ ...getEnvironment(), localDatabaseAdminUrl: process.env.LOCAL_DATABASE_ADMIN_URL });
     console.log('Database migrations completed.');
 }
 

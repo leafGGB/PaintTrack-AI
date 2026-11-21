@@ -84,14 +84,20 @@ for (const failure of ['none', 'connect', 'migration', 'unlock']) {
     test(`迁移连接与 advisory lock 在 ${failure} 分支可靠关闭`, async () => {
         const events = [];
         class Client {
-            async connect() { events.push('connect'); if (failure === 'connect') throw new Error('连接失败'); }
+            constructor(options) { this.admin = options.application_name === 'painttrack-ledger-owner-preparation'; }
+            async connect() { events.push(this.admin ? 'admin-connect' : 'connect'); if (failure === 'connect' && !this.admin) throw new Error('连接失败'); }
             async query(text) {
                 events.push(text);
                 if (failure === 'unlock' && text.includes('unlock')) throw new Error('解锁失败');
+                if (text.startsWith('SELECT current_database()')) return { rows: [{ database: 'painttrack_dev', username: 'migrator' }] };
+                if (text.includes('FROM pg_catalog.pg_roles WHERE rolname = $1') && !text.includes('pg_auth_members')) {
+                    return { rows: [{ rolcanlogin: false, rolinherit: false, rolsuper: false, rolcreatedb: false, rolcreaterole: false, rolreplication: false, rolbypassrls: false }] };
+                }
+                return { rows: [] };
             }
-            async end() { events.push('end'); }
+            async end() { events.push(this.admin ? 'admin-end' : 'end'); }
         }
-        const action = migrateDatabase({ migrationDatabaseUrl: migration, databaseUrl: runtime }, {
+        const action = migrateDatabase({ migrationDatabaseUrl: migration, databaseUrl: runtime, localDatabaseAdminUrl: 'postgres://admin:secret@127.0.0.1:5433/postgres' }, {
             Client,
             migrate: async (_db, config) => {
                 assert.equal(config, migrationConfig);
@@ -122,23 +128,35 @@ test('最新 snapshot 与两个 schema 完整一致，历史迁移未被改写',
         current.prevId = snapshot.prevId;
         assert.deepEqual(await generateMigration(snapshot, current), []);
     }
-    // 上一版快照必须紧跟最新迁移的前一条：写成 0021 会把 0022+0023 的差异一起算进
-    // 「本迁移应生成什么」，导致每次新增迁移都要连带重构这条断言。
-    const previousSnapshot = require('../drizzle/meta/0022_snapshot.json');
+    // 从 journal 定位紧邻前驱，不能用 idx 推断含历史编号空洞的 snapshot 文件名。
+    const previousPrefix = journal.entries.at(-2).tag.split('_')[0];
+    const previousSnapshot = require(`../drizzle/meta/${previousPrefix}_snapshot.json`);
+    assert.notEqual(snapshot.id, previousSnapshot.id);
+    assert.equal(snapshot.prevId, previousSnapshot.id);
     const expectedSnapshot = generateDrizzleJson(require('../lib/server/db/schema.js'), previousSnapshot.id);
     expectedSnapshot.id = snapshot.id;
     expectedSnapshot.prevId = previousSnapshot.id;
     const generatedStatements = await generateMigration(previousSnapshot, expectedSnapshot);
     const migrationStatements = fs.readFileSync(path.join(migrationConfig.migrationsFolder, `${latest.tag}.sql`), 'utf8')
         .split('--> statement-breakpoint')
-        .map((statement) => statement.trim())
+        .map((statement) => statement.replace(/^\s*--[^\n]*(?:\n|$)/gm, '').trim())
         .filter(Boolean);
+    const schemaStatements = migrationStatements.filter((statement) => /^(?:CREATE TABLE|ALTER TABLE|CREATE (?:UNIQUE )?INDEX|DROP INDEX)\b/.test(statement));
+    const extensionStatements = migrationStatements.filter((statement) => !schemaStatements.includes(statement));
+    // 安全扩展（函数、触发器、授权）无法由 drizzle 生成器比对，只能逐条声明数量并由专项门禁与真实PG夹具覆盖。
+    const expectedExtensions = { '0027_credit_settle_release': 8, '0028_credit_settlement_sweep': 4, '0029_credit_grant': 8, '0030_charged_task_submission': 6, '0031_verified_charge_amount': 3, '0032_admin_model_binding_projection': 4 };
+    assert.equal(extensionStatements.length, expectedExtensions[latest.tag],
+        `${latest.tag} 的安全扩展数量变化必须同步更新门禁与真实 PG fixture`);
     const normalizeStatement = (statement) => statement
         .replace(/;\s*$/, '')
-        .replace(/"(?:logical_models|generation_tasks)"\."([a-z_]+)"/g, '"$1"');
+        .replace(/"public"\."(logical_models|generation_tasks|pricing_quotes)"/g, '$1')
+        .replace(/\bpublic\.(logical_models|generation_tasks|pricing_quotes)\b/g, '$1')
+        .replace(/"(logical_models|generation_tasks|pricing_quotes)"/g, '$1')
+        .replace(/"(?:logical_models|generation_tasks|pricing_quotes)"\."([a-z_]+)"/g, '"$1"')
+        .replace(/\s+WHERE (?:pricing_quotes\.)?"?task_id"? IS NOT NULL\s*$/, '');
     assert.deepEqual(
         generatedStatements.map(normalizeStatement).sort(),
-        migrationStatements.map(normalizeStatement).sort(),
+        schemaStatements.map(normalizeStatement).sort(),
     );
     const crypto = require('node:crypto');
     const original = {

@@ -8,14 +8,28 @@ const { sql } = require('drizzle-orm');
 const { fork } = require('node:child_process');
 const queue = require('../lib/server/worker/taskQueue');
 const { parseDatabaseTarget, assertDistinctRuntimeIdentity, assertIsolatedTestTarget } = require('../lib/server/db/testIsolation');
-const { migrateDatabase } = require('../lib/server/db/migrate');
+const { adminModelsOwnerRole, ledgerOwnerRole, migrateDatabase, prepareAdminModelsOwner, prepareLedgerOwner } = require('../lib/server/db/migrate');
 // 本地 mock 路由 fixture 需要真实的 objectStore 才能走完归档路径；
 // 用内存实现即可，验收结束后随进程释放，不落盘。
 const { MemoryObjectStore } = require('../lib/server/storage/memoryObjectStore');
 
 const root = path.resolve(__dirname, '..');
 const quote = (value) => `"${value.replaceAll('"', '""')}"`;
-const safeCode = (error) => /^[0-9A-Z]{5}$/.test(error.code || '') ? error.code : 'LOCAL_CHECK_FAILED';
+const nestedErrors = (error) => {
+    const result = [];
+    const seen = new Set();
+    const visit = (value) => {
+        if (!value || (typeof value !== 'object' && typeof value !== 'function') || seen.has(value)) return;
+        seen.add(value);
+        result.push(value);
+        if (value.cause) visit(value.cause);
+        if (Array.isArray(value.errors)) for (const nested of value.errors) visit(nested);
+        if (value.originalError) visit(value.originalError);
+    };
+    visit(error);
+    return result;
+};
+const safeCode = (error) => nestedErrors(error).map((item) => item.code).find((code) => /^[0-9A-Z]{5}$/.test(code)) || 'LOCAL_CHECK_FAILED';
 const compareText = (left, right) => left < right ? -1 : left > right ? 1 : 0;
 // 权限清单比对失败时，把差异写进断言首行。只包含表名/列名/权限名，不含任何凭据。
 const privilegeDelta = (actual, expected) => {
@@ -28,18 +42,22 @@ const privilegeDelta = (actual, expected) => {
 };
 // 断言失败时回写"脱敏后的差异摘要"，便于定位；邮箱、URL、长令牌/哈希一律替换为占位符。
 // 只保留表名、列名、字段名、布尔值和数字等结构信息。
-const safeAssertionHint = (error) => {
-    if (error?.name !== 'AssertionError') return undefined;
-    const text = String(error.message || '')
+const safeErrorHint = (error) => {
+    const parts = nestedErrors(error).flatMap((item) => [item.message, item.detail, item.hint])
+        .filter((value) => typeof value === 'string' && !/^Failed query:/i.test(value));
+    if (!parts.length) return undefined;
+    const text = parts.join(' | ')
         .replace(/[\w.+-]+@[\w-]+\.[\w.-]+/g, '<email>')
         .replace(/[a-z][a-z0-9+.-]*:\/\/\S+/gi, '<url>')
+        .replace(/(?:password|passwd|secret|token|credential)(?:\s*[:=]\s*)\S+/gi, '<secret-redacted>')
         .replace(/[A-Za-z0-9_-]{24,}/g, '<redacted>')
         .replace(/\s+/g, ' ')
         .trim()
         .slice(0, 600);
-    if (!text) return undefined;
-    return text;
+    return text || undefined;
 };
+
+const safeAssertionHint = (error) => error?.name === 'AssertionError' ? safeErrorHint(error) : undefined;
 // 只回写受控的源码位置（fixture 或验收脚本），不输出异常正文，避免凭据或 SQL 参数落盘。
 const sourceLocation = (error) => {
     const match = error?.stack?.match(/((?:tests[\\/]fixtures[\\/][a-z-]+\.cjs|scripts[\\/]accept-database-local\.js)):(\d+):/);
@@ -198,7 +216,7 @@ async function clearLegacyRows(databaseUrl, legacy) {
     });
 }
 
-async function checkDatabase({ runtimeUrl, workerUrl, migrationUrl, runtimeRole, workerRole, cleanupRole, migrationRole, bootstrapRole, record }) {
+async function checkDatabase({ runtimeUrl, workerUrl, migrationUrl, adminUrl, runtimeRole, workerRole, cleanupRole, migrationRole, bootstrapRole, record }) {
     assertIsolatedTestTarget({ testDatabaseUrl: runtimeUrl, testMigrationDatabaseUrl: migrationUrl,
         databaseUrl: process.env.DATABASE_URL, migrationDatabaseUrl: process.env.MIGRATION_DATABASE_URL });
     await withClient(migrationUrl, async (client) => {
@@ -206,7 +224,7 @@ async function checkDatabase({ runtimeUrl, workerUrl, migrationUrl, runtimeRole,
         assert.deepEqual(tables.rows, []);
     });
     record('空库确认', 'passed');
-    const config = { databaseUrl: runtimeUrl, migrationDatabaseUrl: migrationUrl };
+    const config = { databaseUrl: runtimeUrl, migrationDatabaseUrl: migrationUrl, localDatabaseAdminUrl: adminUrl };
     await migrateDatabase(config, { migrate: async (database, settings) => {
         const { readMigrationFiles } = require('drizzle-orm/migrator');
         await database.dialect.migrate(readMigrationFiles(settings).slice(0, 6), database.session, settings);
@@ -285,17 +303,27 @@ async function checkDatabase({ runtimeUrl, workerUrl, migrationUrl, runtimeRole,
         assert.equal(after0020.rows.length, beforeMfa.length + 3, '非空0017→0020升级应只追加0018→0020三条迁移');
         assert.deepEqual(after0020.rows.slice(0, beforeMfa.length), beforeMfa, 'MFA 迁移不得改写既有迁移记录');
         const before0021 = after0020.rows;
+        await migrateDatabase(config, { migrate: async (database, settings) => {
+            const index = journal.entries.findIndex(entry => entry.tag === '0032_admin_model_binding_projection');
+            assert.notEqual(index, -1);
+            await database.dialect.migrate(readMigrationFiles(settings).slice(0, index), database.session, settings);
+        } });
+        const before0032 = (await client.query('SELECT id, hash, created_at FROM public.__drizzle_migrations ORDER BY id')).rows;
+        assert.equal(before0032.length, before0021.length + 11, '非空0020→0031应追加十一条迁移');
+        assert.deepEqual(before0032.slice(0, before0021.length), before0021);
+        await migrateDatabase(config);
         await migrateDatabase(config);
         const after = await client.query('SELECT id, hash, created_at FROM public.__drizzle_migrations ORDER BY id');
-        assert.equal(after.rows.length, journal.entries.length, '0023 应应用全部剩余迁移');
-        assert.equal(after.rows.length, before0021.length + 3, '非空0020→0023升级应追加0021约束、0022清理列与0023孤儿列三条迁移');
-        assert.deepEqual(after.rows.slice(0, before0021.length), before0021, '0021/0022/0023 迁移不得改写既有迁移记录');
+        assert.equal(after.rows.length, before0032.length + 1);
+        assert.deepEqual(after.rows.slice(0, before0032.length), before0032);
+        await assertLegacyRowsRemainUnrouted(migrationUrl, legacy);
+        record('管理员模型投影 0031→0032 增量与重复迁移保留历史', 'passed');
         await require('../tests/fixtures/route-snapshot-constraints-postgres.cjs').checkRouteSnapshotConstraints(client, record);
         const totpColumn = await client.query(`SELECT data_type, is_nullable FROM information_schema.columns
             WHERE table_schema='public' AND table_name='admin_mfa_factors' AND column_name='last_totp_counter'`);
         assert.deepEqual(totpColumn.rows, [{ data_type: 'bigint', is_nullable: 'YES' }]);
         record('非空0017→0020 MFA迁移保留历史记录并新增TOTP重放保护列', 'passed', { migrationsApplied: after0020.rows.length - beforeMfa.length });
-        record('非空0020→0023约束、清理列与孤儿回收列迁移仅追加三条记录并保留历史快照字段', 'passed');
+        record('非空0020→0031十一条迁移仅追加记录并保留历史快照字段', 'passed');
         assert.equal(after.rows.length, journal.entries.length);
         for (let i = 0; i < journal.entries.length; i++) {
             const entry = journal.entries[i];
@@ -353,6 +381,10 @@ async function checkDatabase({ runtimeUrl, workerUrl, migrationUrl, runtimeRole,
         await client.query(`GRANT SELECT ON public.users TO ${quote(bootstrapRole)}`);
         await client.query(`GRANT INSERT (email,password_hash,email_verified_at,role) ON public.users TO ${quote(bootstrapRole)}`);
     });
+
+    const projectionAdminUrl = new URL(adminUrl);
+    projectionAdminUrl.pathname = new URL(runtimeUrl).pathname;
+    await withClient(projectionAdminUrl.href, client => require('../lib/server/db/runtimePermissions').grantAdminModelsProjectionPermission(client, runtimeRole));
 
     await withClient(runtimeUrl, async (client) => {
         const privileges = await client.query(`SELECT rolsuper, rolcreatedb, rolcreaterole, rolreplication, rolbypassrls FROM pg_roles WHERE rolname=current_user`);
@@ -618,6 +650,9 @@ function launchPostgresWorker(workerUrl, mode, children) {
     }
     env.PAINTTRACK_WORKER_DATABASE_URL = url.href;
     env.PAINTTRACK_POSTGRES_WORKER_MODE = mode;
+    // 只领取本段自建任务类型：Worker 默认可领取任意就绪任务，共享验收库里的
+    // 其它夹具遗留的排队/过期任务会被先领走，让并发断言假失败。
+    env.PAINTTRACK_POSTGRES_WORKER_TASK_TYPE = 'postgres-worker-acceptance';
     const child = fork(path.join(root, 'tests/fixtures/worker-postgres.cjs'), [], {
         env, execArgv: [], stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     });
@@ -746,7 +781,24 @@ async function checkPostgresWorkers({ runtimeUrl, workerUrl, migrationUrl, recor
         assert.equal(completed.last_error, null);
     };
     try {
-        assert.equal((await pool.query('SELECT count(*)::int AS count FROM generation_tasks')).rows[0].count, 0);
+        // 只统计本段专用任务类型：其他夹具（如原子冻结）会保留终态合成任务且不可删除。
+        assert.equal((await pool.query("SELECT count(*)::int AS count FROM generation_tasks WHERE task_type='postgres-worker-acceptance'")).rows[0].count, 0);
+        // 其它夹具可能留下仍可领取的排队任务，或租约已自然过期、会被领取事务重新排队的 running 任务。
+        // Worker 子进程已按 PAINTTRACK_POSTGRES_WORKER_TASK_TYPE 收窄领取范围，这里只留痕说明隔离生效。
+        const foreignClaimable = (await pool.query(
+            `SELECT 'queued' AS kind, task_type, count(*)::int AS count FROM generation_tasks
+              WHERE task_type<>'postgres-worker-acceptance' AND status='queued' AND available_at <= now()
+              GROUP BY task_type
+             UNION ALL
+             SELECT 'expired-running' AS kind, task_type, count(*)::int AS count FROM generation_tasks
+              WHERE task_type<>'postgres-worker-acceptance' AND status='running' AND lease_expires_at <= now()
+              GROUP BY task_type
+             ORDER BY kind, task_type`,
+        )).rows;
+        record('Worker 领取范围按本段任务类型收窄（其它夹具遗留可领取任务已隔离）', 'passed', {
+            foreignClaimableTasks: foreignClaimable.reduce((sum, row) => sum + row.count, 0),
+            foreignClaimable: foreignClaimable.map(({ kind, task_type, count }) => ({ kind, taskType: task_type, count })),
+        });
         // 并发同键提交必须收敛成一个任务：唯一索引负责决胜，事务内读回负责让失败方拿到同一结果。
         const idempotentInput = {
             ownerId: '00000000-0000-4000-8000-0000000000aa',
@@ -788,7 +840,8 @@ async function checkPostgresWorkers({ runtimeUrl, workerUrl, migrationUrl, recor
         for (let round = 1; round <= 4; round++) {
             const claims = await Promise.all(concurrent.map((child) => child.wait('started', round)));
             for (const [index, claim] of claims.entries()) {
-                assert.ok(tasks.some((task) => task.id === claim.taskId));
+                assert.ok(tasks.some((task) => task.id === claim.taskId),
+                    `Worker 领取了本段之外的任务（${claim.taskId}），领取范围必须锁定 postgres-worker-acceptance`);
                 assert.equal(claim.attempts, 1);
                 claimedIds.push(claim.taskId);
                 const persisted = await row(claim.taskId);
@@ -813,7 +866,8 @@ async function checkPostgresWorkers({ runtimeUrl, workerUrl, migrationUrl, recor
             await Promise.all(concurrent.map((child, index) => finish(child, claims[index].taskId)));
         }
         assert.equal(claimedIds.length, tasks.length);
-        assert.equal((await pool.query("SELECT count(*)::int AS count FROM generation_tasks WHERE status='succeeded' AND attempts=1")).rows[0].count, 12);
+        // 只统计本套件自己创建的任务类型：共享验收库里其他夹具也会留下成功任务，全局计数会误报。
+        assert.equal((await pool.query("SELECT count(*)::int AS count FROM generation_tasks WHERE task_type='postgres-worker-acceptance' AND status='succeeded' AND attempts=1")).rows[0].count, 12);
         await Promise.all(concurrent.map(stop));
         assert.ok(concurrent.every((child) => child.messages.filter((message) => message.event === 'started').length === 4));
         record('真实多Worker并发12任务无重复领取及空闲停止连接释放', 'passed', {
@@ -875,8 +929,8 @@ async function checkPostgresWorkers({ runtimeUrl, workerUrl, migrationUrl, recor
             await stop(recovery);
             record(mode === 'cooperative' ? '真实Worker协作停止无成功/失败写入且连接释放及恢复' : '真实Worker非协作停止非零退出且连接释放及恢复', 'passed');
         }
-        assert.equal((await pool.query('SELECT count(*)::int AS count FROM generation_tasks')).rows[0].count, 15);
-        assert.equal((await pool.query("SELECT count(*)::int AS count FROM generation_tasks WHERE status<>'succeeded' OR lease_token IS NOT NULL OR lease_expires_at IS NOT NULL")).rows[0].count, 0);
+        assert.equal((await pool.query("SELECT count(*)::int AS count FROM generation_tasks WHERE task_type='postgres-worker-acceptance'")).rows[0].count, 15);
+        assert.equal((await pool.query("SELECT count(*)::int AS count FROM generation_tasks WHERE task_type='postgres-worker-acceptance' AND (status<>'succeeded' OR lease_token IS NOT NULL OR lease_expires_at IS NOT NULL)")).rows[0].count, 0);
     } finally {
         // 只终止本次验收创建的子进程，不触碰任何已有进程或数据库资源。
         try {
@@ -1175,7 +1229,7 @@ async function checkWebRolePrivileges({ adminUrl, database, record }) {
 async function main() {
     // 只使用调用方显式提供的环境；验收入口不得隐式读取 .env。
     const suffix = `${Date.now().toString(36)}_${crypto.randomBytes(3).toString('hex')}`;
-    const names = { database: `pt_acceptance_${suffix}`, migrationRole: `pt_migrate_${suffix}`, runtimeRole: `pt_runtime_${suffix}`, workerRole: `pt_worker_${suffix}`, cleanupRole: `pt_cleanup_${suffix}`, bootstrapRole: `pt_bootstrap_${suffix}` };
+    const names = { database: `pt_acceptance_${suffix}`, migrationRole: `pt_migrate_${suffix}`, runtimeRole: `pt_runtime_${suffix}`, workerRole: `pt_worker_${suffix}`, cleanupRole: `pt_cleanup_${suffix}`, bootstrapRole: `pt_bootstrap_${suffix}`, ledgerOwnerRole: ledgerOwnerRole(`pt_acceptance_${suffix}`), adminModelsOwnerRole: adminModelsOwnerRole(`pt_acceptance_${suffix}`) };
     const log = path.join(root, '.workbuddy', `database-acceptance-${suffix}.json`);
     assert.ok(fs.statSync(path.dirname(log)).isDirectory());
     const report = { startedAt: new Date().toISOString(), endpoint: 'loopback:5433', proposed: names, created: [], checks: [], status: 'running' };
@@ -1218,6 +1272,12 @@ async function main() {
                 report.created.push({ role });
                 record('新建独立角色', 'passed', { role });
             }
+            await prepareLedgerOwner(client, names.database);
+            report.created.push({ role: names.ledgerOwnerRole });
+            record('新建无登录账本函数owner（尚无成员关系）', 'passed');
+            await prepareAdminModelsOwner(client, names.database);
+            report.created.push({ role: names.adminModelsOwnerRole });
+            record('新建无登录模型投影owner（尚无成员关系）', 'passed');
             await client.query(`CREATE DATABASE ${quote(names.database)} OWNER ${quote(names.migrationRole)} TEMPLATE template0`);
             report.created.push({ database: names.database });
             await client.query(`REVOKE ALL ON DATABASE ${quote(names.database)} FROM PUBLIC`);
@@ -1227,7 +1287,8 @@ async function main() {
             await client.query('REVOKE CREATE ON SCHEMA public FROM PUBLIC');
             await client.query('REVOKE USAGE ON SCHEMA public FROM PUBLIC');
         });
-        await checkDatabase({ runtimeUrl, workerUrl, migrationUrl, bootstrapUrl, ...names, record });
+        await checkDatabase({ runtimeUrl, workerUrl, migrationUrl, adminUrl, bootstrapUrl, ...names, record });
+        record('迁移完成后撤回账本owner临时成员关系，运行身份零新增账务授权', 'passed');
         await checkWebRolePrivileges({ adminUrl, database: names.database, record });
         await checkWorkerRolePrivileges({ adminUrl, database: names.database, record });
         await checkCleanupRolePrivileges({ adminUrl, database: names.database, record });
@@ -1247,6 +1308,21 @@ async function main() {
         const workerPool = new Pool({ connectionString: workerUrl, max: 6, connectionTimeoutMillis: 3000 });
         const cleanupPool = new Pool({ connectionString: cleanupUrl, max: 2, connectionTimeoutMillis: 3000 });
         try {
+            const isolatedAdmin = new URL(adminUrl);
+            isolatedAdmin.pathname = `/${names.database}`;
+            await runFixture('credit-foundation-postgres', () => withClient(isolatedAdmin.href, (admin) => withClient(migrationUrl, (owner) => require('../tests/fixtures/credit-foundation-postgres.cjs').checkCreditFoundation(admin, owner, [registrationPool, workerPool, cleanupPool, bootstrapPool], names, record))));
+            await runFixture('pricing-persistence-postgres', () => withClient(isolatedAdmin.href, (admin) => withClient(migrationUrl, (owner) => require('../tests/fixtures/pricing-persistence-postgres.cjs').checkPricingPersistence(admin, owner, [registrationPool, workerPool, cleanupPool, bootstrapPool], names, isolatedAdmin.href, record))));
+            await runFixture('atomic-task-pricing-postgres', () => withClient(isolatedAdmin.href, (admin) => withClient(migrationUrl, (owner) => require('../tests/fixtures/atomic-task-pricing-postgres.cjs').checkAtomicTaskPricing(admin, owner, [registrationPool, workerPool, cleanupPool, bootstrapPool], names, isolatedAdmin.href, record))));
+            await runFixture('credit-settlement-postgres', () => withClient(isolatedAdmin.href, (admin) => withClient(migrationUrl, (owner) => require('../tests/fixtures/credit-settlement-postgres.cjs').checkCreditSettlement(admin, owner, [registrationPool, workerPool, cleanupPool, bootstrapPool], names, isolatedAdmin.href, record))));
+            await runFixture('credit-settlement-sweep-postgres', () => withClient(isolatedAdmin.href, (admin) => withClient(migrationUrl, (owner) => require('../tests/fixtures/credit-settlement-sweep-postgres.cjs').checkCreditSettlementSweep(admin, owner, [registrationPool, workerPool, cleanupPool, bootstrapPool], names, isolatedAdmin.href, record))));
+            await runFixture('settlement-host-postgres', () => require('../tests/fixtures/settlement-host-postgres.cjs').checkSettlementHost(isolatedAdmin.href, runtimeUrl, names.database, record));
+            await runFixture('assets-collection-postgres', () => withClient(isolatedAdmin.href, (admin) => require('../tests/fixtures/assets-collection-postgres.cjs').checkAssetsCollection(admin, runtimeUrl, names, record)));
+            await runFixture('assets-session-http-postgres', () => withClient(isolatedAdmin.href, (admin) => require('../tests/fixtures/assets-session-http-postgres.cjs').checkAssetsSessions(admin, registrationPool, names, record)));
+            await runFixture('account-credits-postgres', () => require('../tests/fixtures/account-credits-postgres.cjs').checkAccountCredits(isolatedAdmin.href, runtimeUrl, record));
+            await runFixture('admin-models-projection-postgres', () => withClient(isolatedAdmin.href, admin => require('../tests/fixtures/admin-models-projection-postgres.cjs').checkAdminModelsProjection(admin, runtimeUrl, names, record)));
+            await runFixture('pricing-publish-cli-postgres', () => withClient(isolatedAdmin.href, (admin) => require('../tests/fixtures/pricing-publish-cli-postgres.cjs').checkPricingPublishCli(admin, isolatedAdmin.href, { runtimeUrl, workerUrl, cleanupUrl }, record)));
+            await runFixture('credit-grant-postgres', () => withClient(isolatedAdmin.href, (admin) => require('../tests/fixtures/credit-grant-postgres.cjs').checkCreditGrant(admin, isolatedAdmin.href, { runtimeUrl, workerUrl, cleanupUrl }, record)));
+            await runFixture('charged-submission-postgres', () => withClient(isolatedAdmin.href, (admin) => require('../tests/fixtures/charged-submission-postgres.cjs').checkChargedSubmission(admin, isolatedAdmin.href, { runtimeUrl, workerUrl, cleanupUrl, runtimeRole: names.runtimeRole }, record)));
             await runFixture('admin-bootstrap-postgres', async () => {
                 const bootstrapFixture = require('../tests/fixtures/admin-bootstrap-postgres.cjs');
                 const owner = new Client({ connectionString: migrationUrl, connectionTimeoutMillis: 3000 });
@@ -1269,7 +1345,7 @@ async function main() {
             await runFixture('email-outbox-postgres', () => withClient(migrationUrl, (owner) => require('../tests/fixtures/email-outbox-postgres.cjs').checkEmailOutboxWorker(workerPool, record, { owner })));
             await runFixture('provider-call-ledger-postgres', () => withClient(migrationUrl, (owner) => require('../tests/fixtures/provider-call-ledger-postgres.cjs').checkProviderCallLedger(workerPool, record, { webPool: registrationPool, owner })));
             await runFixture('task-executor-postgres', () => withClient(migrationUrl, (owner) => require('../tests/fixtures/task-executor-postgres.cjs').checkTaskExecutor(workerPool, record, { webPool: registrationPool, owner })));
-            await runFixture('local-mock-route-postgres', () => withClient(migrationUrl, (owner) => require('../tests/fixtures/local-mock-route-postgres.cjs').checkLocalMockRoute(workerPool, record, { webPool: registrationPool, owner, ...names, objectStore: new MemoryObjectStore() })));
+            await runFixture('local-mock-route-postgres', () => withClient(migrationUrl, (owner) => require('../tests/fixtures/local-mock-route-postgres.cjs').checkLocalMockRoute(workerPool, record, { webPool: registrationPool, owner, ...names, objectStore: new MemoryObjectStore(), workerUrl, storageParent: path.dirname(log) })));
             await runFixture('task-cancel-postgres', () => withClient(migrationUrl, (owner) => require('../tests/fixtures/task-cancel-postgres.cjs').checkTaskCancellation(registrationPool, record, { workerPool, owner })));
             await runFixture('authorization-postgres', () => withClient(migrationUrl, (owner) => require('../tests/fixtures/authorization-postgres.cjs').checkAuthorization(registrationPool, owner, record)));
             await runFixture('asset-purge-postgres', () => withClient(migrationUrl, (owner) => require('../tests/fixtures/asset-purge-postgres.cjs').checkAssetPurge(cleanupPool, record, { owner })));
@@ -1292,8 +1368,9 @@ async function main() {
         report.status = 'passed';
     } catch (error) {
         report.status = 'failed';
-        // 仅记录受控源码位置，不输出可能包含密码、token或SQL参数的异常正文。
-        record('本地验收终止', 'failed', { code: safeCode(error), ...sourceLocation(error), hint: safeAssertionHint(error) });
+
+        // 只记录错误码与脱敏摘要，不输出连接串、凭据、完整 SQL 或参数。
+        record('本地验收终止', 'failed', { code: safeCode(error), ...sourceLocation(error), hint: safeErrorHint(error) });
         process.exitCode = 1;
     } finally {
         report.finishedAt = new Date().toISOString();
@@ -1311,6 +1388,9 @@ module.exports = {
     checkPostgresWorkers,
     checkTaskExecutor: require('../tests/fixtures/task-executor-postgres.cjs').checkTaskExecutor,
     checkTaskCancellation: require('../tests/fixtures/task-cancel-postgres.cjs').checkTaskCancellation,
+    checkPricingPublishCli: require('../tests/fixtures/pricing-publish-cli-postgres.cjs').checkPricingPublishCli,
+    checkCreditGrant: require('../tests/fixtures/credit-grant-postgres.cjs').checkCreditGrant,
+    checkChargedSubmission: require('../tests/fixtures/charged-submission-postgres.cjs').checkChargedSubmission,
     localAdminUrl,
     localUrl,
 };

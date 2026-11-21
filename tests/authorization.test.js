@@ -29,6 +29,48 @@ test('资产内容读取仅返回ready且归属当前用户的私有存储定位
     await assert.rejects(requireOwnedAssetContent({ async execute() { return { rows: [{ id, status: 'pending', storage_key: null }] }; } }, owner, id), (error) => error.code === 'NOT_FOUND');
 });
 
+test('资产内容端点支持带归属校验的字节范围读取', async () => {
+    const id = '00000000-0000-4000-8000-000000000055';
+    const owner = { id: '00000000-0000-4000-8000-000000000001', role: 'user' };
+    let databaseCall = 0;
+    const database = { async execute() {
+        databaseCall += 1;
+        if (databaseCall % 2 === 1) return { rows: [{ id: owner.id, role: owner.role }] };
+        return { rows: [{ id, status: 'ready', storage_key: 'users/private/key', mime_type: 'video/mp4' }] };
+    } };
+    const objectStore = { async getObject() { return { body: Buffer.from('0123456789'), sizeBytes: 10 }; } };
+    const handler = createAuthorizationHandler('asset.content', { environment, database, sink: quiet, objectStore });
+    const get = (headers = {}, cookie = `painttrack_session=${token}`) => handler(
+        new Request(environment.APP_BASE_URL, { headers: { cookie, origin: environment.APP_BASE_URL, ...headers } }),
+        { params: Promise.resolve({ id }) },
+    );
+
+    const partial = await get({ range: 'bytes=3-6' });
+    assert.equal(partial.status, 206);
+    assert.equal(partial.headers.get('accept-ranges'), 'bytes');
+    assert.equal(partial.headers.get('content-range'), 'bytes 3-6/10');
+    assert.equal(partial.headers.get('content-length'), '4');
+    assert.equal(await partial.text(), '3456');
+
+    const suffix = await get({ range: 'bytes=-3' });
+    assert.equal(suffix.status, 206);
+    assert.equal(suffix.headers.get('content-range'), 'bytes 7-9/10');
+    assert.equal(await suffix.text(), '789');
+
+    const invalid = await get({ range: 'bytes=10-' });
+    assert.equal(invalid.status, 416);
+    assert.equal(invalid.headers.get('content-range'), 'bytes */10');
+
+    const full = await get();
+    assert.equal(full.status, 200);
+    assert.equal(full.headers.get('accept-ranges'), 'bytes');
+    assert.equal(full.headers.get('content-length'), '10');
+    assert.equal(await full.text(), '0123456789');
+
+    const anonymous = await get({ range: 'bytes=0-1' }, '');
+    assert.equal(anonymous.status, 401);
+});
+
 test('资产软删除只对本人ready资产生效，重复删除幂等且他人资产不泄露', async () => {
     const id = '00000000-0000-4000-8000-000000000066';
     const owner = { id: '00000000-0000-4000-8000-000000000001', role: 'user' };

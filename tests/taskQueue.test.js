@@ -57,6 +57,54 @@ test('claimNextTask recovers expired leases and claims with SKIP LOCKED and a ne
     assert.equal(updateCall.values[3], 'worker-a');
 });
 
+test('claimNextTask binds the fixture task type in the locked queue selection', async () => {
+    const pool = scriptedPool([
+        { rowCount: 0, rows: [] },
+        { rowCount: 1, rows: [{ id: 'cancel-task', status: TASK_STATUS.QUEUED }] },
+        { rowCount: 1, rows: [{ id: 'cancel-task', status: TASK_STATUS.RUNNING }] },
+    ]);
+    const claimed = await claimNextTask(pool, {
+        workerId: 'cancel-fixture-worker',
+        leaseSeconds: 30,
+        taskType: 'task-cancel-fixture',
+    });
+    assert.equal(claimed.id, 'cancel-task');
+    const selection = pool.calls.find((call) => /FOR UPDATE SKIP LOCKED/.test(call.text));
+    assert.match(selection.text, /\(\$2::text IS NULL OR task_type = \$2\)/);
+    assert.match(selection.text, /\(\$3::uuid IS NULL OR id = \$3::uuid\)/);
+    assert.deepEqual(selection.values, [TASK_STATUS.QUEUED, 'task-cancel-fixture', null]);
+});
+
+test('trusted scope binds the same complete snapshot list for recovery and locked selection', async () => {
+    const pool = scriptedPool([]);
+    const approvedRoutes = [{ model_pk: '11111111-1111-4111-8111-111111111111', snapshot_version: 1,
+        snapshot_hash: 'a'.repeat(64), snapshot: { logicalModelId: 'trusted-image' },
+        owner_id: '22222222-2222-4222-8222-222222222222' }];
+    assert.equal(await claimNextTask(pool, { workerId: 'worker-a', approvedRoutes }), null);
+    const [, recovery, selection] = pool.calls;
+    for (const query of [recovery, selection]) {
+        assert.match(query.text, /logical_model_pk = approved\.model_pk/);
+        assert.match(query.text, /route_snapshot_version = approved\.snapshot_version/);
+        assert.match(query.text, /route_snapshot_hash = approved\.snapshot_hash/);
+        assert.match(query.text, /route_snapshot = approved\.snapshot/);
+        assert.match(query.text, /generation_tasks\.owner_id = approved\.owner_id/);
+        assert.deepEqual(JSON.parse(query.values.at(-1)), approvedRoutes);
+    }
+    assert.match(recovery.text, /jsonb_to_recordset\(\$5::jsonb\)/);
+    assert.match(selection.text, /jsonb_to_recordset\(\$4::jsonb\)/);
+    assert.ok(pool.calls.every(({ text }) => !text.includes('attempts = attempts + 1')));
+    await assert.rejects(claimNextTask(pool, { workerId: 'worker-a', approvedRoutes: [] }), TypeError);
+});
+
+test('Mock worker limits both recovery and claim to legacy or Mock snapshots', async () => {
+    const pool = scriptedPool([]);
+    assert.equal(await claimNextTask(pool, { workerId: 'mock-worker', mockOnly: true }), null);
+    const [, recovery, selection] = pool.calls;
+    for (const query of [recovery, selection]) {
+        assert.match(query.text, /route_snapshot IS NULL OR route_snapshot->>'adapterType' = 'mock'/);
+    }
+});
+
 test('heartbeat, complete, and fail updates fence on the lease token', async () => {
     const pool = scriptedPool([
         { rowCount: 1, rows: [{ id: 'task', status: TASK_STATUS.RUNNING }] },

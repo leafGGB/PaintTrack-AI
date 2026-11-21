@@ -136,6 +136,53 @@ if (require.main !== module) {
         assert.equal((await worker.runOnce()).status, 'stopped');
     });
 
+    test('可信单图启动只向完整匹配的任务快照提供受闸门保护的适配器', async () => {
+        const { createModelRouteResolver } = require('../lib/server/tasks/modelRouteResolver');
+        const model = { id: 'c1111111-1111-4111-8111-111111111111', logicalModelId: 'trusted-image',
+            mediaType: 'image', enabled: true, catalogVersion: 1, supportedOperations: ['image.generate'], bindings: [{
+                id: 'binding-image', enabled: true, isPrimary: true, bindingVersion: 1,
+                providerInstance: { id: binding.providerInstanceId, enabled: true, configVersion: 1,
+                    credentialVersion: binding.credentialVersion, adapterType: binding.adapterType },
+                providerModel: { id: 'upstream-image', enabled: true, validationState: 'verified', mediaType: 'image',
+                    capabilities: { operations: ['image.generate'] }, upstreamModelName: binding.upstreamModel,
+                    adapterVersion: '1', operationProfile: 'image.generate', requestMappingVersion: 1, responseMappingVersion: 1 },
+            }] };
+        const catalog = { async getLogicalModel(id) { return id === model.logicalModelId ? model : null; } };
+        const payload = { logicalModelId: model.logicalModelId, prompt: 'Test image', outputCount: 1 };
+        const route = await createModelRouteResolver({ catalog }).resolve({ taskType: 'image.generate', payload });
+        const baseTask = { id: 'c2222222-2222-4222-8222-222222222222', lease_token: 'synthetic-lease',
+            attempts: 1, task_type: 'image.generate', payload };
+        const task = { ...baseTask, logical_model_pk: route.logicalModelPk,
+            route_snapshot: route.routeSnapshot, route_snapshot_version: route.routeSnapshotVersion,
+            route_snapshot_hash: route.routeSnapshotHash };
+        let submissions = 0;
+        const adapter = { name: 'synthetic-provider', async submit() { submissions++; return { kind: 'unknown' }; },
+            async query() { return { state: 'running' }; },
+            async cancel() { assert.fail('本测试不应取消任务'); } };
+        await bootstrapWorker({ ...options(), trustedCatalog: catalog, logicalModelId: model.logicalModelId }, {
+            adapterFactory: () => adapter,
+            createTaskProcessor: (config) => ({ ...config, processTask: require('../lib/server/worker/taskExecutor').createTaskProcessor(config) }),
+            run: async ({ createProcessor }) => {
+                const pool = { query() { assert.fail('拒绝任务不应查询数据库'); }, connect() { assert.fail('拒绝任务不应连接数据库'); } };
+                const { provider, providerSelector, requireTrustedRoute, processTask } = createProcessor({ pool });
+                assert.equal(requireTrustedRoute, true);
+                assert.equal(provider, undefined);
+                await assert.rejects(processTask(baseTask), { code: 'TASK_ROUTE_REQUIRED' });
+                for (const rejected of [
+                    { ...task, route_snapshot_hash: 'wrong' },
+                    { ...task, route_snapshot: { ...task.route_snapshot, providerInstanceId: 'other' } },
+                    { ...task, task_type: 'video.generate' },
+                    { ...task, payload: { ...payload, outputCount: 2 } },
+                ]) await assert.rejects(processTask(rejected), { code: 'TASK_ROUTE_REJECTED' });
+                assert.equal(submissions, 0);
+                const selected = await providerSelector.select(task);
+                assert.notEqual(selected, adapter);
+                await selected.submit();
+            },
+        });
+        assert.equal(submissions, 1);
+    });
+
     test('所有配置、绑定与秘密预检失败均无 run/Pool/processor/connect/claim，且释放委派资源', async (t) => {
         legacyEnvironment(t);
         const cases = [

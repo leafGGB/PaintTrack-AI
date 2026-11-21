@@ -162,6 +162,69 @@
       "when": 1794364260000,
       "tag": "0023_orphan_asset_reclaim",
       "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "7",
+      "when": 1794801056619,
+      "tag": "0024_credit_ledger_foundation",
+      "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1794801056620,
+      "tag": "0025_pricing_persistence",
+      "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "7",
+      "when": 1794878194374,
+      "tag": "0026_task_quote_reserve_atomic",
+      "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1794883470610,
+      "tag": "0027_credit_settle_release",
+      "breakpoints": true
+    },
+    {
+      "idx": 27,
+      "version": "7",
+      "when": 1794884450416,
+      "tag": "0028_credit_settlement_sweep",
+      "breakpoints": true
+    },
+    {
+      "idx": 28,
+      "version": "7",
+      "when": 1794886533317,
+      "tag": "0029_credit_grant",
+      "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "7",
+      "when": 1794886593317,
+      "tag": "0030_charged_task_submission",
+      "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "7",
+      "when": 1794886653317,
+      "tag": "0031_verified_charge_amount",
+      "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "7",
+      "when": 1794886713317,
+      "tag": "0032_admin_model_binding_projection",
+      "breakpoints": true
     }
   ]
 }
